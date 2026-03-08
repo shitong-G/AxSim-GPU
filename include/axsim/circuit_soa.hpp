@@ -28,6 +28,9 @@ struct CircuitSoA {
     /// Which node ids are primary outputs (length num_outputs)
     std::vector<int> output_node_ids;
 
+    /// If non-empty, is_output_complemented[o] means PO o is logically NOT of output_node_ids[o] (length num_outputs)
+    std::vector<uint8_t> is_output_complemented;
+
     bool valid() const;
 };
 

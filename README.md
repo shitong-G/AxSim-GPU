@@ -76,9 +76,11 @@ To target specific GPU architectures with CMake: `-DCMAKE_CUDA_ARCHITECTURES="70
 AxSim-GPU/
 ├── include/axsim/
 │   ├── circuit_soa.hpp    # SoA struct and flatten_from_aig()
-│   └── gpu_metrics.hpp    # run_gpu_metrics(), run_gpu_simulation_only(), config/result types
+│   ├── gpu_metrics.hpp    # run_gpu_metrics(), run_gpu_simulation_only(), config/result types
+│   └── abc_interface.hpp  # soa_from_abc_file() — read AIG/BLIF/Verilog via ABC
 ├── src/
 │   ├── circuit_soa.cpp    # CPU SoA construction from AIG list
+│   ├── interface.cpp      # ABC → SoA (optional; build with AXSIM_USE_ABC and link libabc)
 │   ├── main_axsim.cpp     # Example: small AIG → SoA → GPU metrics
 │   └── metrics.py         # Python reference: ER, MRED, MSE (truth-table)
 ├── cuda/
@@ -97,12 +99,20 @@ AxSim-GPU/
 
 ### C++ (GPU path)
 
-1. **Build a circuit in SoA form** (e.g. from your AIG/ABC front-end):
+1. **Build a circuit in SoA form** — from an ABC netlist file (AIG/BLIF/Verilog, etc.):
+
+   ```cpp
+   #include "axsim/abc_interface.hpp"
+   using namespace axsim;
+
+   CircuitSoA soa = soa_from_abc_file("design.aig");  // or .blif, .v, ...
+   if (!soa.valid()) { /* handle read/strash failure */ }
+   ```
+
+   Or build SoA manually (e.g. from your own AIG front-end):
 
    ```cpp
    #include "axsim/circuit_soa.hpp"
-   using namespace axsim;
-
    int num_pis = 2;
    std::vector<std::tuple<int,int,bool,bool>> and_nodes = { {0, 1, false, false} };
    std::vector<int> out_ids = {2};
@@ -160,6 +170,8 @@ mse = m.compute_mse(g_values, f_values)
 - **ABC integration**: In `circuit_soa.cpp` (or a new module), traverse the AIG from your ABC handle, collect `(fanin0, fanin1, compl0, compl1)` in topological order, and call `flatten_from_aig()` or fill `CircuitSoA` directly.
 - **Reference outputs**: Obtain `ref_outputs` from a golden netlist (e.g. CPU simulation or another GPU run) in the packed format above.
 - **Performance**: See `docs/GPU_SKELETON.md` for shared-memory caching of PIs, CUB-based reduction, and a single output-gather kernel.
+
+**Building with ABC (optional):** To enable `soa_from_abc_file()` for AIG/BLIF/Verilog, build with ABC: define `AXSIM_USE_ABC`, add ABC include path (e.g. `-I path/to/abc/src`), and link libabc. Example with Make: `make CXXFLAGS="-DAXSIM_USE_ABC -I/path/to/abc/src" LDFLAGS="-L/path/to/abc -labc"`. Without ABC, the interface compiles as a stub that returns an invalid SoA.
 
 A **checklist of remaining work** (ref output pipeline, large-pattern grid limit, ABC/AIG wiring, optional optimizations, MEM, tests) is in [docs/TODO.md](docs/TODO.md).
 

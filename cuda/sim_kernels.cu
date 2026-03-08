@@ -173,6 +173,20 @@ __global__ void mred_sum_kernel(
     if (threadIdx.x == 0) block_sums[blockIdx.x] = sh[0];
 }
 
+// Apply output complement: for each output o with is_compl[o]==1, flip all bits in that output row
+__global__ void apply_output_complement_kernel(
+    uint64_t* __restrict__ out_bits,
+    const uint8_t* __restrict__ is_compl,
+    int num_outputs,
+    int num_blocks_64)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_outputs * num_blocks_64;
+    if (idx >= total) return;
+    int o = idx / num_blocks_64;
+    if (is_compl[o]) out_bits[idx] = ~out_bits[idx];
+}
+
 // MSE: (1/N)*sum (g-f)^2. For 0/1: (g-f)^2 is 0 or 1, so sum of squared errors = popc(g^f).
 __global__ void mse_sum_kernel(
     const uint64_t* __restrict__ approx,
@@ -286,6 +300,16 @@ GpuMetricsResult run_gpu_metrics(
         }
     }
 
+    // Apply PO complement if set (e.g. from ABC)
+    if (!soa.is_output_complemented.empty() && (int)soa.is_output_complemented.size() == num_outputs) {
+        uint8_t* d_compl = nullptr;
+        cudaMalloc(&d_compl, num_outputs * sizeof(uint8_t));
+        cudaMemcpy(d_compl, soa.is_output_complemented.data(), num_outputs * sizeof(uint8_t), cudaMemcpyHostToDevice);
+        int nflip = num_outputs * (int)num_blocks_64;
+        apply_output_complement_kernel<<<(nflip + BLOCK - 1) / BLOCK, BLOCK>>>(d_approx_out, d_compl, num_outputs, (int)num_blocks_64);
+        cudaFree(d_compl);
+    }
+
     // Error rate reduction (launch enough blocks to cover output size)
     int nred = (int)(num_outputs * num_blocks_64 + BLOCK - 1) / BLOCK;
     if (nred > MAX_BLOCKS) nred = MAX_BLOCKS;
@@ -367,6 +391,15 @@ std::vector<uint64_t> run_gpu_simulation_only(
         uint64_t* src = d_node_values + nid;
         uint64_t* dst = out.data() + o * num_blocks_64;
         cudaMemcpy2D(dst, sizeof(uint64_t), src, num_nodes * sizeof(uint64_t), sizeof(uint64_t), (int)num_blocks_64, cudaMemcpyDeviceToHost);
+    }
+
+    // Apply PO complement on host (same effect as kernel for simulation-only path)
+    if (!soa.is_output_complemented.empty() && (int)soa.is_output_complemented.size() == num_outputs) {
+        for (int o = 0; o < num_outputs; o++) {
+            if (soa.is_output_complemented[o])
+                for (size_t b = 0; b < num_blocks_64; b++)
+                    out[o * num_blocks_64 + b] = ~out[o * num_blocks_64 + b];
+        }
     }
 
     cudaFree(d_node_values);

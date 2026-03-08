@@ -21,9 +21,9 @@ endif
 # Output and objects (all .o in build/)
 BUILD     := build
 EXE       := $(BUILD)/axsim_main
-SRC_CPP   := src/main_axsim.cpp src/circuit_soa.cpp
+SRC_CPP   := src/main_axsim.cpp src/circuit_soa.cpp src/interface.cpp
 SRC_CU    := cuda/sim_kernels.cu
-OBJ_CPP   := $(BUILD)/main_axsim.o $(BUILD)/circuit_soa.o
+OBJ_CPP   := $(BUILD)/main_axsim.o $(BUILD)/circuit_soa.o $(BUILD)/interface.o
 OBJ_CU    := $(BUILD)/sim_kernels.o
 OBJS      := $(OBJ_CPP) $(OBJ_CU)
 
@@ -34,6 +34,9 @@ $(BUILD)/main_axsim.o: src/main_axsim.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/circuit_soa.o: src/circuit_soa.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/interface.o: src/interface.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/sim_kernels.o: cuda/sim_kernels.cu | $(BUILD)

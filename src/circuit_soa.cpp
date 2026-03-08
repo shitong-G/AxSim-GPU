@@ -15,6 +15,7 @@ bool CircuitSoA::valid() const {
     if ((int)is_compl0.size() != num_ands) return false;
     if ((int)is_compl1.size() != num_ands) return false;
     if ((int)output_node_ids.size() != num_outputs) return false;
+    if (!is_output_complemented.empty() && (int)is_output_complemented.size() != num_outputs) return false;
     return true;
 }
 
