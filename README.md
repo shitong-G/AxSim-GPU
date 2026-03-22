@@ -24,6 +24,16 @@ AxSim-GPU is an open-source library for fast evaluation of approximate circuits.
 
 ---
 
+## Current status
+
+- **Cross-circuit metrics**: `run_gpu_simulation_only` on the **golden** SoA produces packed `ref_outputs`; `run_gpu_metrics(approx_soa, ref_outputs, config)` simulates the **approximate** SoA with the **same** `seed` so random PIs match. Example in `src/main_axsim.cpp`: AND as reference, OR (De Morgan on the AIG) as approximate—non-zero ER/MSE (~50% bit mismatch for random MC on 2 inputs).
+- **MRED (GPU)**: Implemented as a **per-output-bit** sum of \(|g-f|/\max(|f|,\delta)\) to align with `metrics.py`. For **Boolean** comparisons where the golden output is often 0, use **`delta` near 1** (e.g. `1.0f`) so MRED stays on the same scale as ER; very small \(\delta\) inflates terms when \(f=0\).
+- **Build (Make)**: `CUDA_HOME` defaults to `/usr/local/cuda` (override if `cuda_runtime.h` is not found). Device code uses **`-std=c++14`** for older `nvcc`; host code remains **C++17**. Link/search paths: `-I$(CUDA_HOME)/include`, `-L$(CUDA_HOME)/lib64`.
+- **Headers**: `circuit_soa.hpp` includes `<tuple>` for standards-conforming builds (e.g. GCC 7).
+- **Still open**: large-pattern grid cap (\(>65535\) blocks), ABC/AIG file flow, CUDA error checks, gather kernel, CUB—see [docs/TODO.md](docs/TODO.md).
+
+---
+
 ## Implemented Metrics
 
 | Metric | Formula | Notes |
@@ -55,7 +65,7 @@ make
 ./build/axsim_main
 ```
 
-Optional: debug build `make DEBUG=1`; target a different GPU `make CUDA_ARCH=sm_80`; run directly `make run`.
+Optional: debug build `make DEBUG=1`; target a different GPU `make CUDA_ARCH=sm_80`; CUDA toolkit path `make CUDA_HOME=/path/to/cuda`; older CUDA 11+ nvcc may use `make NVCC_STD=c++17`; run directly `make run`.
 
 **Using CMake:**
 
@@ -86,7 +96,8 @@ AxSim-GPU/
 ├── cuda/
 │   └── sim_kernels.cu     # Monte Carlo kernels, error/MRED/MSE reductions, host API impl
 ├── docs/
-│   └── GPU_SKELETON.md    # Design notes and extension points (e.g. ABC, CUB, shared memory)
+│   ├── GPU_SKELETON.md    # Design notes and extension points (e.g. ABC, CUB, shared memory)
+│   └── TODO.md            # Progress snapshot and remaining work
 ├── Makefile               # Build with make (default)
 ├── CMakeLists.txt         # Alternative: build with CMake
 ├── LICENSE

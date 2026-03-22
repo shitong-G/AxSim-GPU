@@ -5,18 +5,22 @@ CXX       ?= g++
 NVCC      ?= nvcc
 INC       := -I include
 CXXFLAGS  := -std=c++17 $(INC) -O2 -Wall
-NVCCFLAGS := -std=c++17 $(INC) -O2
+# Older nvcc (CUDA 10.x and below) rejects -std=c++17; .cu code is C++14-compatible.
+# Override on CUDA 11+:  make NVCC_STD=c++17
+NVCC_STD  ?= c++14
+NVCCFLAGS := -std=$(NVCC_STD) $(INC) -O2
 LDFLAGS   :=
 
 # CUDA architecture (override: make CUDA_ARCH=sm_80)
 CUDA_ARCH ?= sm_70
-NVCCFLAGS += -arch=$(CUDA_ARCH)
 
 # Debug build
 ifdef DEBUG
   CXXFLAGS  := -std=c++17 $(INC) -O0 -g -Wall
-  NVCCFLAGS := -std=c++17 $(INC) -O0 -g
+  NVCCFLAGS := -std=$(NVCC_STD) $(INC) -O0 -g
 endif
+
+NVCCFLAGS += -arch=$(CUDA_ARCH)
 
 # Output and objects (all .o in build/)
 BUILD     := build

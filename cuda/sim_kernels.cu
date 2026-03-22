@@ -138,9 +138,7 @@ __global__ void error_count_kernel(
     if (threadIdx.x == 0) block_sums[blockIdx.x] = sh[0];
 }
 
-// MRED: per-pattern |g-f|/max(|f|, delta). For 0/1 outputs, |g-f| is 0 or 1; interpret as float.
-// Pack: we have bits, so "value" = popc of output word for multi-output, or use single output.
-// Skeleton: compute per-thread sum of relative errors, then block reduce.
+// MRED: mean over all output bits of |g-f|/max(|f|,delta). Each packed bit is one pattern (boolean 0/1).
 __global__ void mred_sum_kernel(
     const uint64_t* __restrict__ approx,
     const uint64_t* __restrict__ reference,
@@ -151,18 +149,21 @@ __global__ void mred_sum_kernel(
 {
     __shared__ double sh[256];
     double local = 0.0;
+    double d = (double)delta;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_outputs * num_blocks_64;
     for (int i = idx; i < total; i += gridDim.x * blockDim.x) {
         uint64_t a = approx[i];
         uint64_t r = reference[i];
         uint64_t diff = a ^ r;
-        int c = __popcll(diff);
-        if (c == 0) continue;
-        // For boolean: each differing bit contributes 1.0 / max(1, delta) or 1.0 when f=1
-        // Simplified: relative error = |a-r|/max(|r|, delta). For bits, |r| is 0 or 1 -> 1/max(1,delta) or 1/1
-        double denom = fmax((double)__popcll(r), (double)delta);
-        local += (double)c / denom;
+        if (diff == 0) continue;
+        for (int bit = 0; bit < 64; ++bit) {
+            uint64_t mask = 1ull << bit;
+            if ((diff & mask) == 0) continue;
+            double fbit = (r & mask) ? 1.0 : 0.0;
+            double denom = fmax(fbit, d);  // max(|f|, delta) for f in {0,1}
+            local += 1.0 / denom;
+        }
     }
     sh[threadIdx.x] = local;
     __syncthreads();

@@ -1,6 +1,17 @@
 # AxSim-GPU 待完善清单
 
-本文档列出当前代码框架中**需要你补充或修复**的部分，按优先级和模块分类。
+本文档列出**已完成进度**与**仍需补充**的部分，按优先级和模块分类。
+
+---
+
+## 零、近期已完成（进度快照）
+
+| 项 | 说明 |
+|----|------|
+| 双网表误差流程 | 已验证：`ref = run_gpu_simulation_only(soa_golden, config)`，`run_gpu_metrics(soa_approx, ref, config)`，同一 `seed` 下 PI 对齐。`main_axsim.cpp` 示例：AND 为 golden、OR（德摩根 AIG）为 approximate。 |
+| MRED kernel | `mred_sum_kernel` 已改为**按输出比特**累加 \(\|g-f\|/\max(\|f\|,\delta)\)，与 `metrics.py` 一致；布尔对比时若 \(\delta\) 过小会在 \(f=0\) 时放大，示例中建议 **`delta = 1.0f`**。 |
+| 构建 | Makefile：`CUDA_HOME`、`nvcc` 默认 **C++14**、`-I/-L`、DEBUG 下不丢失 `-arch`；`circuit_soa.hpp` 补充 `<tuple>`。 |
+| 示例 | 已**不再**用手写 `uint64` 冒充 ref；跨电路对比取代“自比”演示。 |
 
 ---
 
@@ -8,23 +19,20 @@
 
 ### 1. 参考输出 `ref_outputs` 的来源
 
-- **现状**：`run_gpu_metrics(soa, ref_outputs, config)` 要求调用方传入已打包好的 `ref_outputs`（黄金网表在相同 pattern 下的输出比特）。
-- **待做**：
-  - 若用**黄金 AIG**：对同一批随机 pattern 在 CPU 或 GPU 上跑一次黄金电路仿真，得到 `std::vector<uint64_t> ref_outputs`，再传入。
-  - 或提供**库内接口**：例如 `run_gpu_metrics_with_reference_circuit(soa_approx, soa_golden, config)`，内部对 `soa_golden` 跑一次 `run_gpu_simulation_only` 得到 `ref_outputs`，再与近似电路比较。（注意两次仿真需用同一组随机 pattern，即同一 seed 或显式传入同一批 PI。）
+- **现状**：`run_gpu_metrics(soa_approx, ref_outputs, config)` 要求调用方传入已打包好的 `ref_outputs`。**手动路径已打通**：对 golden SoA 调用 `run_gpu_simulation_only` 即可得到与 `seed` 一致的参考比特（见 `main_axsim.cpp`）。
+- **仍待做**：
+  - **库内封装**（可选）：例如 `run_gpu_metrics_with_reference_circuit(soa_approx, soa_golden, config)`，内部对 `soa_golden` 跑一次 `run_gpu_simulation_only` 再比较，减少重复与误用。
+  - 从**文件/ABC** 读入 netlist 后再走上述流程（与第 3 项一起）。
 
 ### 2. 大规模 pattern 时的 grid 上限
 
-- **现状**：`nblk = (num_blocks_64 + BLOCK - 1) / BLOCK`，若 `nblk > 65535` 被截断为 65535，导致只仿真了 65535×256 个 64-pattern 块，其余 pattern 未仿真。
-- **待做**：用**多轮 launch** 或 **2D grid**（如 `dim3 grid((nblk + 65535 - 1) / 65535, 65535)` 等）覆盖全部 `num_blocks_64`，并在 kernel 里用 `blockIdx.x + blockIdx.y * 65535` 等计算全局 block 下标。
+- **现状**：`nblk = (num_blocks_64 + BLOCK - 1) / BLOCK`，若 `nblk > 65535` 被截断为 65535，导致只仿真了部分 64-pattern 块，其余 pattern 未仿真。
+- **待做**：用**多轮 launch** 或 **2D grid** 覆盖全部 `num_blocks_64`，并在 kernel 里用组合 `blockIdx` 计算全局 `block_idx`。
 
 ### 3. ABC（或其它 AIG 源）对接
 
-- **现状**：SoA 仅能通过 `flatten_from_aig(num_pis, and_nodes, out_ids)` 从内存中的列表构建；没有从 AIG 文件或 ABC 直接读入的代码。
-- **待做**：
-  - 在 `src/` 下实现 AIG 解析（如读 AIGER 或调用 ABC API），遍历得到拓扑序的 AND 列表及每个 AND 的 fanin id、取反位。
-  - 调用现有 `flatten_from_aig()` 或直接填充 `CircuitSoA`，供后续 `run_gpu_metrics` / `run_gpu_simulation_only` 使用。
-  - 可选：提供命令行工具，例如 `axsim_main <exact.aig> <approx.aig> -p 65536`，内部完成读 AIG → SoA → 黄金仿真 → 近似仿真 → 输出 ER/MRED/MSE。
+- **现状**：SoA 仍通过 `flatten_from_aig(num_pis, and_nodes, out_ids)` 从内存列表构建；**无**从 AIG 文件或 ABC 直接读入的完整示例。
+- **待做**：AIGER 解析或 ABC API；拓扑序 AND 列表；可选 CLI `axsim_main <exact.aig> <approx.aig> -p 65536`。
 
 ---
 
@@ -32,18 +40,18 @@
 
 ### 4. 输出抽取改为 GPU kernel
 
-- **现状**：在 host 上对每个 output 调用 `cudaMemcpy2D`，把 `node_values` 中对应节点的 strided 列拷到 `d_approx_out`。
-- **待做**：写一个 `gather_outputs_kernel`：每个 thread 负责若干 `(output_id, block_64_id)`，从 `node_values[block_idx * num_nodes + output_node_ids[o]]` 读到 `d_approx_out[o * num_blocks_64 + block_idx]`。需要把 `output_node_ids` 拷到 device 或作为 constant。这样可减少多次 D2D copy 和 launch 开销。
+- **现状**：在 host 上对每个 output 调用 `cudaMemcpy2D` 把 `node_values` 中对应节点的 strided 列拷到 `d_approx_out`。
+- **待做**：`gather_outputs_kernel`：从 `node_values[block_idx * num_nodes + output_node_ids[o]]` 写到 `d_approx_out[o * num_blocks_64 + block_idx]`。
 
 ### 5. CUDA 错误检查
 
 - **现状**：`cudaMalloc` / `cudaMemcpy` / `cudaFree` 及 kernel launch 的返回值未检查。
-- **待做**：在关键路径上使用 `cudaError_t err = cuda...; if (err != cudaSuccess) { ... }`，或在 Debug 构建中统一用宏包装，失败时打印 `cudaGetErrorString(err)` 并返回错误或 abort。
+- **待做**：统一宏或 `cudaError_t` 检查，失败时打印 `cudaGetErrorString(err)`。
 
 ### 6. Reduction 使用 CUB
 
-- **现状**：Error count / MRED sum 使用自定义 block reduce，结果写回 `block_sums`，再在 host 上循环求和。
-- **待做**：用 CUB 的 `cub::DeviceReduce::Sum`（或类似）在 device 上做单次全局 reduction，减少 kernel 数和 host 端循环，代码更简洁且通常更快。需在 `sim_kernels.cu` 中 `#include <cub/cub.cuh>` 并链接/包含 CUB（CUDA 自带）。
+- **现状**：Error count / MRED sum 使用自定义 block reduce + host 求和。
+- **待做**：`cub::DeviceReduce::Sum` 等全局 reduce（CUDA Toolkit 自带 CUB）。
 
 ---
 
@@ -51,28 +59,24 @@
 
 ### 7. Shared memory 缓存 PI
 
-- **现状**：蒙特卡洛 kernel 中每个 thread 从 global 的 `row[]` 读 fanin 值；PI 的读取频率高。
-- **待做**：在 `monte_carlo_kernel` 中为当前 block 的 PI 行分配 `__shared__ uint64_t pi_cache[]`，由 block 内线程协作加载一次，AND 计算时若 fanin 是 PI 则从 shared 读。可减少对 `node_values` 的 global 访问。
+- **待做**：`__shared__` 缓存当前 block 的 PI 行，降低 global 读。
 
 ### 8. 随机数：LCG → curand
 
-- **现状**：设备上用简单 LCG 生成随机比特，统计性质一般。
-- **待做**：若需要更好统计质量或可重复性，可改用 cuRAND（如 `curand_init` + `curand()`），在 kernel 中按 block/thread 初始化状态并生成 PI 的 uint64。会略增依赖与复杂度。
+- **待做**：可选 cuRAND 提升统计性质或可控性。
 
 ### 9. PI 生成的 coalesce（蒙特卡洛）
 
-- **现状**：`monte_carlo_kernel_simple` 里注释了 “TODO: coalesce PI generation with other threads”；当前每个 thread 独立写自己的 `row[i]`，对 global 的写是合并的，但可进一步优化。
-- **待做**：若同一 block 内多个 thread 负责不同 block_idx，可考虑让同一 warp 协作生成/写 PI，或与 shared memory 缓存结合，减少重复计算（若存在）。
+- **现状**：`monte_carlo_kernel_simple` 中仍有 “TODO: coalesce PI generation with other threads” 注释。
+- **待做**：warp 协作或结合 shared PI 缓存。
 
 ### 10. MEM（Maximum Error Magnitude）
 
-- **现状**：README 中列出 MEM 为 “planned”；当前仅实现 ER、MRED、MSE。
-- **待做**：若电路输出为多比特整数值，MEM = max_x |g(x) − f(x)|。实现方式：仿真得到近似与参考的整型输出（或从现有比特打包），在 GPU 上求差、取绝对值，再用 `cub::DeviceReduce::Max` 或自定义 max-reduction 得到全局最大值。
+- **待做**：多比特输出时 \(\max_x |g(x)-f(x)|\)。
 
 ### 11. 多值输出的 MRED/MSE
 
-- **现状**：MRED/MSE 的 kernel 按比特差（或 0/1）处理；对多比特整数输出，当前逻辑相当于把每个 bit 当独立 0/1 处理。
-- **待做**：若需要“按整数输出”的 MRED/MSE（即先把每 64 个 pattern 的比特聚合成整数再算 |g−f|/max(|f|,δ) 和 (g−f)²），需在 kernel 中按输出位宽打包成整数再算相对误差/平方误差，并相应调整 reduction。
+- **待做**：按整数输出位宽聚合后再算相对误差 / 平方误差（与当前按 bit 打包的语义区分）。
 
 ---
 
@@ -80,34 +84,32 @@
 
 ### 12. 示例与测试
 
-- **现状**：`main_axsim.cpp` 仅演示一个 2-input AND，ref 为手写的一个 uint64。
-- **待做**：
-  - 增加从 AIG 文件读入的示例（在完成第 3 项后）。
-  - 加一两组小电路 + 黄金 ref，对 ER/MRED/MSE 与 Python `metrics.py` 或手算结果做数值对比，作为单元测试或 CI。
+- **现状**：`main_axsim.cpp` 已演示 **两 SoA、golden vs approximate**（AND / OR），非零 ER/MSE；**尚未**有从 AIG 读入的示例。
+- **待做**：AIG 示例（依赖第 3 项）；小电路 + 与 `metrics.py` 或解析解的**单元测试 / CI**。
 
 ### 13. 文档与 README
 
-- **现状**：README 已按学术库形式写好；`docs/GPU_SKELETON.md` 描述设计与扩展点。
-- **待做**：完成 ABC 对接或 AIG 读取后，在 README 中补充“从 AIG 文件运行”的示例命令和接口说明；若增加 MEM 或多值输出，同步更新 README 的 metrics 表格与 API。
+- **现状**：README 已增加 **Current status**、Make/CUDA 说明、MRED/δ 提示；**TODO** 本文档已同步进度。
+- **待做**：ABC/AIG 流程落地后，补充“从文件运行”与命令行示例；MEM 或多值 metrics 若实现则更新表格。
 
 ---
 
 ## 汇总表
 
-| 序号 | 项           | 类型     | 说明 |
-|------|--------------|----------|------|
-| 1    | ref_outputs 来源 | 必须     | 黄金电路仿真或库内接口 |
-| 2    | 大规模 pattern   | 必须     | 多轮/2D grid 覆盖全部块 |
-| 3    | ABC/AIG 对接     | 必须     | 从文件或 ABC 构建 SoA |
-| 4    | 输出 gather kernel | 建议   | 替代多次 cudaMemcpy2D |
-| 5    | CUDA 错误检查    | 建议     | 所有 cuda* 与 kernel 检查 |
-| 6    | CUB reduction    | 建议     | 单次 device reduce |
-| 7    | Shared memory PI | 可选     | 降低 global 带宽 |
-| 8    | curand           | 可选     | 更好随机数 |
-| 9    | PI coalesce      | 可选     | 与 7 可一起做 |
-| 10   | MEM 指标         | 可选     | 多比特输出时 max \|g−f\| |
-| 11   | 多值 MRED/MSE    | 可选     | 按整数输出计算 |
-| 12   | 示例与测试       | 工程     | AIG 示例 + 数值校验 |
-| 13   | 文档更新         | 工程     | README/API 与实现同步 |
+| 序号 | 项 | 状态 | 说明 |
+|------|--------------|------|------|
+| 1 | ref 来源 | **部分完成** | 手动两 SoA + `run_gpu_simulation_only` 已验证；库内一站式接口仍可选 |
+| 2 | 大规模 pattern | 待做 | 多轮/2D grid |
+| 3 | ABC/AIG 对接 | 待做 | 从文件或 ABC 构建 SoA |
+| 4 | 输出 gather kernel | 待做 | 替代多次 `cudaMemcpy2D` |
+| 5 | CUDA 错误检查 | 待做 | 全部 cuda API |
+| 6 | CUB reduction | 待做 | device 全局 reduce |
+| 7 | Shared memory PI | 可选 | |
+| 8 | curand | 可选 | |
+| 9 | PI coalesce | 可选 | |
+| 10 | MEM | 可选 | |
+| 11 | 多值 MRED/MSE | 可选 | |
+| 12 | 示例与测试 | **部分完成** | 跨电路 demo 已有；AIG + 单元测试仍缺 |
+| 13 | 文档 | **部分完成** | README 已更新；随 AIG 再补 |
 
-完成 **1、2、3** 后，库即可在真实 AIG 流程中正确使用；**4、5、6** 能明显提升健壮性和性能；其余按需求选做。
+完成 **2、3** 后，库即可在**真实 AIG 文件**流程中完整使用；**1** 的库内封装为体验优化；**4、5、6** 提升健壮性与性能；其余按需求选做。

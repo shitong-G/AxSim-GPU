@@ -1,42 +1,46 @@
 /**
- * Example: build a tiny AIG, flatten to SoA, run GPU sim + metrics
+ * Example: treat AND as reference (golden) and OR as approximate — same PIs / same seed
+ * so patterns align; run_gpu_metrics(approx_soa, ref, config) is the intended API shape.
  *
- * Replace the manual AIG construction with your ABC parser when integrating.
+ * OR = ~(~a & ~b): one AND with both fanins complemented + PO complement.
  */
 
 #include "axsim/circuit_soa.hpp"
 #include "axsim/gpu_metrics.hpp"
 #include <cstdio>
+#include <tuple>
 #include <vector>
 
 int main() {
-    // --- A. Build SoA (here: minimal 2-input AND gate as AIG)
-    //     Node 0,1 = PIs, Node 2 = AND(0, 1). One output = node 2.
     const int num_pis = 2;
-    std::vector<std::tuple<int, int, bool, bool>> and_nodes;
-    and_nodes.push_back({0, 1, false, false});  // node 2 = and(node0, node1)
-    std::vector<int> out_ids = {2};
 
-    axsim::CircuitSoA soa = axsim::flatten_from_aig(num_pis, and_nodes, out_ids);
-    if (!soa.valid()) {
+    // Golden: y = a & b
+    std::vector<std::tuple<int, int, bool, bool>> and_only;
+    and_only.push_back({0, 1, false, false});
+    axsim::CircuitSoA soa_and = axsim::flatten_from_aig(num_pis, and_only, {2});
+
+    // Approximate (for this demo): y = a | b  (De Morgan on AIG)
+    std::vector<std::tuple<int, int, bool, bool>> or_as_aig;
+    or_as_aig.push_back({0, 1, true, true});
+    axsim::CircuitSoA soa_or = axsim::flatten_from_aig(num_pis, or_as_aig, {2});
+    soa_or.is_output_complemented = {1};
+
+    if (!soa_and.valid() || !soa_or.valid()) {
         fprintf(stderr, "SoA invalid\n");
         return 1;
     }
 
-    // --- Reference outputs: for 2 inputs, 2^2=4 patterns. We use 64 patterns (1 block) for demo.
-    //     Golden: out = in0 & in1. Packed as 1 output * 1 uint64 = 64 bits (we only care first 4 for exact match).
-    size_t num_patterns = 64;
-    size_t num_blocks_64 = 1;
-    std::vector<uint64_t> ref_outputs(soa.num_outputs * num_blocks_64);
-    // Reference: pattern 0,1,2,3 -> (0,0),(1,0),(0,1),(1,1) -> out 0,0,0,1 -> bits 0,0,0,1
-    ref_outputs[0] = 1u;  // bit0 = pattern 0, bit1 = pattern 1, ... so pattern 3 = bit3 = 1
+    printf("Golden (ref): AND(in0,in1)  |  Approx (simulated): OR(in0,in1)\n");
+    printf("Same seed -> same random PI vectors; metrics = mismatch between the two circuits.\n\n");
 
     axsim::GpuMetricsConfig config;
-    config.num_patterns = num_patterns;
+    config.num_patterns = 64;
     config.seed = 42;
+    // Boolean outputs: golden f=0 makes |g-f|/max(|f|,delta) = 1/delta unless delta is O(1); use 1.0 to match ER scale.
+    config.delta = 1.0f;
 
-    // --- B+C. Run GPU simulation and metrics
-    axsim::GpuMetricsResult res = axsim::run_gpu_metrics(soa, ref_outputs, config);
+    std::vector<uint64_t> ref_outputs = axsim::run_gpu_simulation_only(soa_and, config);
+    axsim::GpuMetricsResult res = axsim::run_gpu_metrics(soa_or, ref_outputs, config);
 
     printf("Error rate: %.6f\n", res.error_rate);
     printf("MRED:       %.6f\n", res.mred);

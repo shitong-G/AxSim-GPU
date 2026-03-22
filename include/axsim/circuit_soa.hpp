@@ -9,6 +9,7 @@
 #define AXSIM_CIRCUIT_SOA_HPP
 
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
 namespace axsim {
