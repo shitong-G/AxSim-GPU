@@ -14,13 +14,17 @@ namespace axsim {
 struct GpuMetricsConfig {
     size_t num_patterns{65536};   ///< total random patterns (multiple of 64 for uint64 bit-parallel)
     unsigned int seed{12345};
-    float delta{1e-6f};           ///< for MRED denominator
+    float delta{1e-6f};           ///< reserved (legacy bit-level MRED path)
+    float mae_normalizer{255.0f}; ///< MAE% denominator (abs_diff_qor uses 2^8-1 = 255)
+    bool outputs_msb_first{true}; ///< reconstruct integer as [o0..on-1]=[MSB..LSB] when true
 };
 
 struct GpuMetricsResult {
-    float error_rate{0.f};
-    float mred{0.f};
-    float mse{0.f};
+    float error_rate{0.f};  ///< pattern-level: #mismatch patterns / #patterns
+    float mae_norm{0.f};    ///< normalized MAE (not percent). MAE% = mae_norm * 100
+    float mred{0.f};        ///< backward-compatible alias of mae_norm
+    float mse{0.f};         ///< word-level mean squared error
+    bool ok{false};         ///< false when input validation/CUDA runtime fails
 };
 
 /**
@@ -38,6 +42,16 @@ struct GpuMetricsResult {
 GpuMetricsResult run_gpu_metrics(
     const CircuitSoA& soa,
     const std::vector<uint64_t>& ref_outputs,
+    const GpuMetricsConfig& config = {}
+);
+
+/**
+ * Safe pair API for exact-vs-approx comparison.
+ * Validates that both circuits have identical PI/PO counts before simulation.
+ */
+GpuMetricsResult run_gpu_metrics_pair(
+    const CircuitSoA& approx_soa,
+    const CircuitSoA& golden_soa,
     const GpuMetricsConfig& config = {}
 );
 

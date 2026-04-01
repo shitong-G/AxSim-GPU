@@ -8,10 +8,11 @@
 
 | 项 | 说明 |
 |----|------|
-| 双网表误差流程 | 已验证：`ref = run_gpu_simulation_only(soa_golden, config)`，`run_gpu_metrics(soa_approx, ref, config)`，同一 `seed` 下 PI 对齐。`main_axsim.cpp` 示例：AND 为 golden、OR（德摩根 AIG）为 approximate。 |
-| MRED kernel | `mred_sum_kernel` 已改为**按输出比特**累加 \(\|g-f\|/\max(\|f\|,\delta)\)，与 `metrics.py` 一致；布尔对比时若 \(\delta\) 过小会在 \(f=0\) 时放大，示例中建议 **`delta = 1.0f`**。 |
+| 双网表误差流程 | 已完成 `run_gpu_metrics_pair(soa_approx, soa_golden, config)`：内部生成参考输出并做 PI/PO 一致性校验。 |
+| 指标语义与接口 | 已增加 `mae_norm`（并保留 `mred` 兼容别名）、`GpuMetricsResult.ok`、`outputs_msb_first` 位序开关。 |
+| 正确性与鲁棒性 | 已补齐 CUDA 错误检查；`num_patterns` 超大时改为分批 launch，避免 65535 grid 截断。 |
 | 构建 | Makefile：`CUDA_HOME`、`nvcc` 默认 **C++14**、`-I/-L`、DEBUG 下不丢失 `-arch`；`circuit_soa.hpp` 补充 `<tuple>`。 |
-| 示例 | 已**不再**用手写 `uint64` 冒充 ref；跨电路对比取代“自比”演示。 |
+| 示例与测试 | `main_axsim.cpp` 已支持命令行输入（netlist 路径/pattern/seed 等）；`manual_metrics_test.cpp` 已覆盖手算可验证案例。 |
 
 ---
 
@@ -19,15 +20,13 @@
 
 ### 1. 参考输出 `ref_outputs` 的来源
 
-- **现状**：`run_gpu_metrics(soa_approx, ref_outputs, config)` 要求调用方传入已打包好的 `ref_outputs`。**手动路径已打通**：对 golden SoA 调用 `run_gpu_simulation_only` 即可得到与 `seed` 一致的参考比特（见 `main_axsim.cpp`）。
-- **仍待做**：
-  - **库内封装**（可选）：例如 `run_gpu_metrics_with_reference_circuit(soa_approx, soa_golden, config)`，内部对 `soa_golden` 跑一次 `run_gpu_simulation_only` 再比较，减少重复与误用。
-  - 从**文件/ABC** 读入 netlist 后再走上述流程（与第 3 项一起）。
+- **现状**：已完成。`run_gpu_metrics_pair(soa_approx, soa_golden, config)` 提供一站式双网表评估路径。
+- **仍待做**：按需要增加更细粒度的输出映射策略（例如自定义 PO bit map）。
 
 ### 2. 大规模 pattern 时的 grid 上限
 
-- **现状**：`nblk = (num_blocks_64 + BLOCK - 1) / BLOCK`，若 `nblk > 65535` 被截断为 65535，导致只仿真了部分 64-pattern 块，其余 pattern 未仿真。
-- **待做**：用**多轮 launch** 或 **2D grid** 覆盖全部 `num_blocks_64`，并在 kernel 里用组合 `blockIdx` 计算全局 `block_idx`。
+- **现状**：已完成。改为多轮 launch，完整覆盖全部 `num_blocks_64`。
+- **待做**：可选 2D grid 版本与性能对比。
 
 ### 3. ABC（或其它 AIG 源）对接
 
@@ -45,8 +44,8 @@
 
 ### 5. CUDA 错误检查
 
-- **现状**：`cudaMalloc` / `cudaMemcpy` / `cudaFree` 及 kernel launch 的返回值未检查。
-- **待做**：统一宏或 `cudaError_t` 检查，失败时打印 `cudaGetErrorString(err)`。
+- **现状**：已完成。关键 CUDA API 和 kernel launch 已检查并输出错误信息。
+- **待做**：按需封装成统一宏，减少样板代码。
 
 ### 6. Reduction 使用 CUB
 
@@ -59,7 +58,8 @@
 
 ### 7. Shared memory 缓存 PI
 
-- **待做**：`__shared__` 缓存当前 block 的 PI 行，降低 global 读。
+- **现状**：已部分完成。`monte_carlo_kernel` 已引入 shared-memory tiling 缓存 AND 描述符（fanin/complement）。
+- **待做**：进一步评估 PI 级缓存和 warp 协作生成随机 PI 的收益。
 
 ### 8. 随机数：LCG → curand
 
@@ -84,8 +84,8 @@
 
 ### 12. 示例与测试
 
-- **现状**：`main_axsim.cpp` 已演示 **两 SoA、golden vs approximate**（AND / OR），非零 ER/MSE；**尚未**有从 AIG 读入的示例。
-- **待做**：AIG 示例（依赖第 3 项）；小电路 + 与 `metrics.py` 或解析解的**单元测试 / CI**。
+- **现状**：`main_axsim.cpp` 已支持命令行（路径/pattern/seed/normalizer/位序）；`manual_metrics_test.cpp` 可直接做手算结果对齐。
+- **待做**：补自动化单元测试/CI。
 
 ### 13. 文档与 README
 
@@ -98,18 +98,18 @@
 
 | 序号 | 项 | 状态 | 说明 |
 |------|--------------|------|------|
-| 1 | ref 来源 | **部分完成** | 手动两 SoA + `run_gpu_simulation_only` 已验证；库内一站式接口仍可选 |
-| 2 | 大规模 pattern | 待做 | 多轮/2D grid |
-| 3 | ABC/AIG 对接 | 待做 | 从文件或 ABC 构建 SoA |
+| 1 | ref 来源 | **已完成** | `run_gpu_metrics_pair` 已落地 |
+| 2 | 大规模 pattern | **已完成** | 多轮 launch 已支持 |
+| 3 | ABC/AIG 对接 | **部分完成** | 文件读取流程可用，第三方 Verilog 兼容性仍需增强 |
 | 4 | 输出 gather kernel | 待做 | 替代多次 `cudaMemcpy2D` |
-| 5 | CUDA 错误检查 | 待做 | 全部 cuda API |
+| 5 | CUDA 错误检查 | **已完成** | 关键 cuda API 与 kernel launch 已覆盖 |
 | 6 | CUB reduction | 待做 | device 全局 reduce |
-| 7 | Shared memory PI | 可选 | |
+| 7 | Shared memory PI | **部分完成** | AND 描述符 shared-memory tiling 已完成 |
 | 8 | curand | 可选 | |
 | 9 | PI coalesce | 可选 | |
 | 10 | MEM | 可选 | |
 | 11 | 多值 MRED/MSE | 可选 | |
-| 12 | 示例与测试 | **部分完成** | 跨电路 demo 已有；AIG + 单元测试仍缺 |
-| 13 | 文档 | **部分完成** | README 已更新；随 AIG 再补 |
+| 12 | 示例与测试 | **部分完成** | CLI + 手算测试已完成；自动化 CI 待补 |
+| 13 | 文档 | **部分完成** | README/TODO 已更新，后续按新特性继续同步 |
 
 完成 **2、3** 后，库即可在**真实 AIG 文件**流程中完整使用；**1** 的库内封装为体验优化；**4、5、6** 提升健壮性与性能；其余按需求选做。

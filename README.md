@@ -26,11 +26,13 @@ AxSim-GPU is an open-source library for fast evaluation of approximate circuits.
 
 ## Current status
 
-- **Cross-circuit metrics**: `run_gpu_simulation_only` on the **golden** SoA produces packed `ref_outputs`; `run_gpu_metrics(approx_soa, ref_outputs, config)` simulates the **approximate** SoA with the **same** `seed` so random PIs match. Example in `src/main_axsim.cpp`: AND as reference, OR (De Morgan on the AIG) as approximate—non-zero ER/MSE (~50% bit mismatch for random MC on 2 inputs).
-- **MRED (GPU)**: Implemented as a **per-output-bit** sum of \(|g-f|/\max(|f|,\delta)\) to align with `metrics.py`. For **Boolean** comparisons where the golden output is often 0, use **`delta` near 1** (e.g. `1.0f`) so MRED stays on the same scale as ER; very small \(\delta\) inflates terms when \(f=0\).
+- **Safe pair-evaluation API**: `run_gpu_metrics_pair(approx_soa, golden_soa, config)` validates PI/PO compatibility, runs golden simulation internally, and evaluates the approximate circuit under the same random vectors.
+- **Large-pattern correctness fix**: Monte Carlo launch now uses tiled launches, so pattern coverage is complete beyond the 65535-grid limit.
+- **Robust runtime checks**: CUDA API calls and kernel launches are checked; `GpuMetricsResult.ok` reports whether computation succeeded.
+- **Metric semantics clarified**: `mae_norm` is the normalized MAE (and `mred` is kept as backward-compatible alias). Output bit order is configurable via `outputs_msb_first`.
+- **Manual verification tests**: `src/manual_metrics_test.cpp` includes hand-computable cases (PASS/FAIL printout) to validate ER/MAE/MSE and bit-order behavior.
 - **Build (Make)**: `CUDA_HOME` defaults to `/usr/local/cuda` (override if `cuda_runtime.h` is not found). Device code uses **`-std=c++14`** for older `nvcc`; host code remains **C++17**. Link/search paths: `-I$(CUDA_HOME)/include`, `-L$(CUDA_HOME)/lib64`.
-- **Headers**: `circuit_soa.hpp` includes `<tuple>` for standards-conforming builds (e.g. GCC 7).
-- **Still open**: large-pattern grid cap (\(>65535\) blocks), ABC/AIG file flow, CUDA error checks, gather kernel, CUB—see [docs/TODO.md](docs/TODO.md).
+- **Still open**: output gather kernel, CUB reduction, optional RNG/curand path, and broader ABC parser compatibility across all third-party Verilog styles—see [docs/TODO.md](docs/TODO.md).
 
 ---
 
@@ -62,10 +64,21 @@ AxSim-GPU is an open-source library for fast evaluation of approximate circuits.
 git clone https://github.com/YOUR_USERNAME/AxSim-GPU.git
 cd AxSim-GPU
 make
-./build/axsim_main
+./build/axsim_main BACS/abs_diff/abs_diff.aig BACS/abs_diff/abs_diff_approx.aig
 ```
 
 Optional: debug build `make DEBUG=1`; target a different GPU `make CUDA_ARCH=sm_80`; CUDA toolkit path `make CUDA_HOME=/path/to/cuda`; older CUDA 11+ nvcc may use `make NVCC_STD=c++17`; run directly `make run`.
+
+`axsim_main` command-line arguments:
+
+```bash
+./build/axsim_main <golden_netlist> <approx_netlist> [num_patterns] [seed] \
+  [--patterns N] [--seed S] [--mae-normalizer X] [--lsb-first]
+```
+
+- Input format is auto-detected by extension through ABC (e.g. `.aig`, `.v`, `.blif`).
+- For unsigned arithmetic where `O[0]` is LSB (e.g. many EvoApprox circuits), use `--lsb-first`.
+- `MAE% = 100 * mae_norm`; pick `--mae-normalizer` per benchmark convention (e.g. 255 for 8-bit `abs_diff`, 511 for 9-bit adders).
 
 **Using CMake:**
 
@@ -91,7 +104,9 @@ AxSim-GPU/
 ├── src/
 │   ├── circuit_soa.cpp    # CPU SoA construction from AIG list
 │   ├── interface.cpp      # ABC → SoA (optional; build with AXSIM_USE_ABC and link libabc)
-│   ├── main_axsim.cpp     # Example: small AIG → SoA → GPU metrics
+│   ├── main_axsim.cpp     # CLI runner: golden vs approximate netlists
+│   ├── manual_metrics_test.cpp # Hand-checkable metric sanity tests
+│   ├── evo_compare.cpp    # EvoApprox-style pair comparison helper
 │   └── metrics.py         # Python reference: ER, MRED, MSE (truth-table)
 ├── cuda/
 │   └── sim_kernels.cu     # Monte Carlo kernels, error/MRED/MSE reductions, host API impl
@@ -130,7 +145,7 @@ AxSim-GPU/
    CircuitSoA soa = flatten_from_aig(num_pis, and_nodes, out_ids);
    ```
 
-2. **Run Monte Carlo and get ER, MRED, MSE**:
+2. **Run Monte Carlo and get ER/MAE/MSE**:
 
    ```cpp
    #include "axsim/gpu_metrics.hpp"
@@ -139,9 +154,9 @@ AxSim-GPU/
    config.num_patterns = 65536;
    config.seed = 12345;
 
-   std::vector<uint64_t> ref_outputs = ...;  // reference bits: num_outputs * ceil(num_patterns/64)
-   GpuMetricsResult res = run_gpu_metrics(soa, ref_outputs, config);
-   // res.error_rate, res.mred, res.mse
+   GpuMetricsResult res = run_gpu_metrics_pair(approx_soa, golden_soa, config);
+   if (!res.ok) { /* handle runtime/validation failure */ }
+   // res.error_rate, res.mae_norm, res.mse
    ```
 
 3. **Simulation only** (e.g. to generate approximate outputs):

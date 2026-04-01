@@ -3,20 +3,37 @@
 
 CXX       ?= g++
 NVCC      ?= nvcc
-INC       := -I include
-CXXFLAGS  := -std=c++17 $(INC) -O2 -Wall
+# CUDA runtime: libcudart/header paths under CUDA toolkit.
+# Prefer nvcc's toolkit root when nvcc is on PATH.
+NVCC_CUDA_HOME := $(shell nvcc --show-cuda-home 2>/dev/null)
+CUDA_HOME      ?= $(if $(strip $(NVCC_CUDA_HOME)),$(NVCC_CUDA_HOME),/usr/local/cuda)
+CUDA_LIB       ?= $(CUDA_HOME)/lib64
+# ABC headers use paths relative to abc/src (e.g. misc/vec/vec.h).
+# ABC_USE_STDINT_H: platform types via stdint (otherwise abc_global.h needs LIN/LIN64/WIN32).
+INC       := -I include -I abc/src
+CXXFLAGS  := -std=c++17 $(INC) -O2 -Wall -DABC_USE_STDINT_H
 # Older nvcc (CUDA 10.x and below) rejects -std=c++17; .cu code is C++14-compatible.
 # Override on CUDA 11+:  make NVCC_STD=c++17
 NVCC_STD  ?= c++14
-NVCCFLAGS := -std=$(NVCC_STD) $(INC) -O2
-LDFLAGS   :=
+NVCCFLAGS := -std=$(NVCC_STD) $(INC) -I$(CUDA_HOME)/include -O2
 
 # CUDA architecture (override: make CUDA_ARCH=sm_80)
 CUDA_ARCH ?= sm_70
 
+# ABC: Io_*, Abc_* symbols come from a static lib built in-tree (see abc/Makefile: libabc.a).
+ABC_DIR        := abc
+ABC_LIB        := $(ABC_DIR)/libabc.a
+# Match src/interface.cpp (-DABC_USE_STDINT_H); skip readline so we do not need -lreadline.
+ABC_MAKE_ARGS  := ABC_USE_STDINT_H=1 ABC_USE_NO_READLINE=1
+
+# Final link uses g++ (not nvcc): nvlink cannot link pure host .o from g++.
+# After pulling on another OS or toolchain, run: make clean && make
+# Order: project .o, then libabc.a, then ABC/CUDA system libs.
+LDFLAGS := $(ABC_LIB) -lm -pthread -ldl -lrt -L$(CUDA_LIB) -lcudart
+
 # Debug build
 ifdef DEBUG
-  CXXFLAGS  := -std=c++17 $(INC) -O0 -g -Wall
+  CXXFLAGS  := -std=c++17 $(INC) -O0 -g -Wall -DABC_USE_STDINT_H
   NVCCFLAGS := -std=$(NVCC_STD) $(INC) -O0 -g
 endif
 
@@ -46,8 +63,11 @@ $(BUILD)/interface.o: src/interface.cpp | $(BUILD)
 $(BUILD)/sim_kernels.o: cuda/sim_kernels.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-$(EXE): $(OBJS)
-	$(NVCC) $(NVCCFLAGS) $(OBJS) -o $@
+$(ABC_LIB):
+	$(MAKE) -C $(ABC_DIR) $(ABC_MAKE_ARGS) libabc.a
+
+$(EXE): $(OBJS) $(ABC_LIB)
+	$(CXX) $(OBJS) -o $@ $(LDFLAGS)
 
 all: $(EXE)
 
