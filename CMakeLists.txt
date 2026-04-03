@@ -15,7 +15,7 @@ find_package(CUDAToolkit REQUIRED)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # CPU SoA (no CUDA)
-add_library(axsim_soa STATIC src/circuit_soa.cpp)
+add_library(axsim_soa STATIC src/circuit_soa.cpp src/pattern_file.cpp)
 target_include_directories(axsim_soa PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # CUDA simulation + metrics (contains run_gpu_metrics, run_gpu_simulation_only)

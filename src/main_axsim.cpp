@@ -7,6 +7,8 @@
 #include "axsim/circuit_soa.hpp"
 #include "axsim/gpu_metrics.hpp"
 #include "axsim/abc_interface.hpp"
+#include "axsim/pattern_file.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <iostream>
@@ -27,7 +29,11 @@ void print_usage(const char* prog) {
         "\n"
         "Notes:\n"
         "  - File format is auto-detected by extension via ABC (supports .aig/.v/.blif/...)\n"
-        "  - --lsb-first sets outputs_msb_first=false for integer reconstruction.\n",
+        "  - Default mae_normalizer=255 fits ~8b-output benchmarks; for w-bit unsigned words use\n"
+        "    about (2^w-1), e.g. 22-bit product -> --mae-normalizer 4194303, or MAE%% explodes.\n"
+        "  - EvoApprox Verilog: use --lsb-first (O[0] is LSB); else integer output is wrong.\n"
+        "  - --patterns-file <.axpi> uses shared PI planes (see benchmarks/tools/pattern_io.py).\n"
+        "  - --print-timing prints EVAL_GPU_S and THROUGHPUT_PATTERNS_PER_S (pair eval only).\n",
         prog, prog, prog, prog);
 }
 
@@ -52,6 +58,8 @@ int main(int argc, char** argv) {
 
     const char* golden_path = argv[1];
     const char* approx_path = argv[2];
+    const char* patterns_file = nullptr;
+    bool print_timing = false;
 
     axsim::GpuMetricsConfig config;
     config.num_patterns = 256000;
@@ -92,6 +100,14 @@ int main(int argc, char** argv) {
             config.outputs_msb_first = false;
         } else if (opt == "--msb-first") {
             config.outputs_msb_first = true;
+        } else if (opt == "--patterns-file") {
+            if (argi + 1 >= argc) {
+                std::fprintf(stderr, "Missing value for %s\n", opt.c_str());
+                return 2;
+            }
+            patterns_file = argv[++argi];
+        } else if (opt == "--print-timing") {
+            print_timing = true;
         } else if (opt == "--help" || opt == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -119,13 +135,27 @@ int main(int argc, char** argv) {
 
     std::printf("Golden (ref): %s\n", golden_path);
     std::printf("Approx (simulated): %s\n", approx_path);
-    std::printf("Same seed -> same random PI vectors; metrics compare the two circuits.\n");
+    if (patterns_file) {
+        if (!axsim::load_axpi010_file(patterns_file, soa1.num_pis, config.num_patterns, config.external_pi_packed)) {
+            return 1;
+        }
+        std::printf("PI patterns: shared file %s (aligned with verilog_eval --patterns-file)\n", patterns_file);
+    } else {
+        std::printf("PI patterns: GPU LCG from seed (not the same as verilog_eval random.Random)\n");
+    }
     std::printf("Config: patterns=%zu seed=%u mae_normalizer=%.6f outputs_msb_first=%d\n\n",
         config.num_patterns, config.seed, config.mae_normalizer, (int)config.outputs_msb_first);
 
+    const auto t_eval0 = std::chrono::steady_clock::now();
     axsim::GpuMetricsResult res = axsim::run_gpu_metrics_pair(soa2, soa1, config);
+    const auto t_eval1 = std::chrono::steady_clock::now();
+    const double eval_s = std::chrono::duration<double>(t_eval1 - t_eval0).count();
+
     if (!res.ok) {
         std::fprintf(stderr, "GPU metric evaluation failed.\n");
+        if (print_timing) {
+            std::printf("EVAL_GPU_S=%.9f\n", eval_s);
+        }
         return 1;
     }
 
@@ -133,6 +163,15 @@ int main(int argc, char** argv) {
     std::printf("EP%%:        %.6f\n", 100.0f * res.error_rate);
     std::printf("MAE%%:       %.6f\n", 100.0f * res.mae_norm);
     std::printf("MSE:         %.6f\n", res.mse);
+
+    if (print_timing) {
+        std::printf("EVAL_GPU_S=%.9f\n", eval_s);
+        if (eval_s > 0.0) {
+            std::printf("THROUGHPUT_PATTERNS_PER_S=%.6f\n", static_cast<double>(config.num_patterns) / eval_s);
+        } else {
+            std::printf("THROUGHPUT_PATTERNS_PER_S=inf\n");
+        }
+    }
 
     return 0;
 }

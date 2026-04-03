@@ -33,6 +33,7 @@ AxSim-GPU is an open-source library for fast evaluation of approximate circuits.
 - **Manual verification tests**: `src/manual_metrics_test.cpp` includes hand-computable cases (PASS/FAIL printout) to validate ER/MAE/MSE and bit-order behavior.
 - **Build (Make)**: `CUDA_HOME` defaults to `/usr/local/cuda` (override if `cuda_runtime.h` is not found). Device code uses **`-std=c++14`** for older `nvcc`; host code remains **C++17**. Link/search paths: `-I$(CUDA_HOME)/include`, `-L$(CUDA_HOME)/lib64`.
 - **Still open**: output gather kernel, CUB reduction, optional RNG/curand path, and broader ABC parser compatibility across all third-party Verilog styles—see [docs/TODO.md](docs/TODO.md).
+- **Benchmark harness**: Shared **AXPI010** (`.axpi`) primary-input files align random vectors across **CPU iverilog** (`verilog_eval_runtime_native.py`), **BLASYS** (`verilog_eval_runtime.py`), and **`axsim_main --patterns-file`**. The native Verilog evaluator streams a hex stimulus file and uses `$readmemh` in the testbench so million-vector runs do not generate multi-gigabyte generated Verilog.
 
 ---
 
@@ -53,6 +54,7 @@ AxSim-GPU is an open-source library for fast evaluation of approximate circuits.
 - **Build**: C++17, CMake ≥ 3.18, CUDA Toolkit (with `nvcc`).
 - **Runtime**: NVIDIA GPU with compute capability ≥ 7.0 (e.g. Volta, Turing, Ampere).
 - **Python** (optional): Python 3 with `numpy` and `bitarray` for `src/metrics.py`.
+- **Runtime benchmarks** (optional): Yosys + Icarus Verilog (`iverilog` / `vvp`) for `verilog_eval_runtime_native.py`; a local BLASYS tree for `verilog_eval_runtime.py` (point `blasys_root` in the JSON at your checkout; use the same Python environment as BLASYS, e.g. conda with `regex`).
 
 ---
 
@@ -73,12 +75,80 @@ Optional: debug build `make DEBUG=1`; target a different GPU `make CUDA_ARCH=sm_
 
 ```bash
 ./build/axsim_main <golden_netlist> <approx_netlist> [num_patterns] [seed] \
-  [--patterns N] [--seed S] [--mae-normalizer X] [--lsb-first]
+  [--patterns N] [--seed S] [--mae-normalizer X] [--lsb-first] [--patterns-file <file.axpi>]
 ```
 
 - Input format is auto-detected by extension through ABC (e.g. `.aig`, `.v`, `.blif`).
 - For unsigned arithmetic where `O[0]` is LSB (e.g. many EvoApprox circuits), use `--lsb-first`.
 - `MAE% = 100 * mae_norm`; pick `--mae-normalizer` per benchmark convention (e.g. 255 for 8-bit `abs_diff`, 511 for 9-bit adders).
+- Optional **`--patterns-file`**: load shared PI planes from an AXPI010 binary (same RNG layout as `benchmarks/tools/pattern_io.py`; use with the same `num_patterns` as stored in the file).
+
+### Runtime benchmarking (same-task comparison)
+
+A runtime harness is provided at `benchmarks/runtime_benchmark.py` to compare **error-evaluation runtime for the same task**:
+
+- baseline: CPU Verilog simulation + metric computation (`benchmarks/tools/verilog_eval_runtime_native.py`)
+- SOTA: BLASYS-compatible evaluation flow (`benchmarks/tools/verilog_eval_runtime.py`, optional)
+- SOTA: Mockturtle Monte Carlo evaluator (AIG input)
+- this project: GPU Monte Carlo (`axsim_main`)
+
+The harness is command-template based, so each method can call your local toolchain directly.
+
+#### Shared primary-input patterns (AXPI010)
+
+To compare **the same** random input vectors on CPU Verilog, BLASYS, and GPU, generate a binary **AXPI010** file (`.axpi`) and pass it via `--patterns-file` in each tool. The format and RNG packing match `benchmarks/tools/pattern_io.py` (LSB-indexed PI bits per pattern). **The PI bit width must match** the flattened design’s total primary-input width (`--bits` in the generator = number of PIs after ABC flattening).
+
+```bash
+python benchmarks/tools/gen_pi_patterns.py benchmarks/patterns/pi_n16_p4M_s42.axpi \
+  --bits 16 --patterns 4000000 --seed 42
+```
+
+Large `.axpi` files are listed in `.gitignore` under `benchmarks/patterns/`. The native Verilog path writes a compact `stim.hex` and uses `$readmemh` in the testbench instead of emitting millions of `#1 pi=...` lines (which previously exhausted RAM and disk).
+
+#### Fair preset (`runtime_config.fair.json`)
+
+`benchmarks/runtime_config.fair.json` is an example **fair** preset: CPU + BLASYS + GPU with a shared `pi_patterns_file`, optional `cpu_affinity` (Linux `taskset`), and Mockturtle disabled by default. Edit **`workspace`**, **`axsim_root`**, **`blasys_root`**, **`pi_patterns_file`**, and benchmark paths to match your machine.
+
+```bash
+python benchmarks/runtime_benchmark.py --config benchmarks/runtime_config.fair.json
+```
+
+Use **`globals.vectors`** / **`patterns`** consistent with the `.axpi` header. If BLASYS needs a specific interpreter (e.g. conda env with `regex`), set **`globals.bench_python`** in the JSON, pass **`--bench-python`**, or export **`AXSIM_BENCH_PYTHON`**.
+
+#### Generic workflow
+
+1. Copy and edit the config:
+
+```bash
+cp benchmarks/runtime_config.example.json benchmarks/runtime_config.json
+```
+
+2. Fill in local paths/commands (`BLASYS`, `mockturtle`, benchmark files, etc.), then run:
+
+```bash
+python3 benchmarks/runtime_benchmark.py --config benchmarks/runtime_config.json
+```
+
+For Mockturtle integration, build helper binary once:
+
+```bash
+g++ -O3 -std=c++17 benchmarks/tools/mockturtle_mc_eval.cpp \
+  /mnt/d/____Research____/mockturtle/lib/fmt/fmt/format.cc \
+  /mnt/d/____Research____/mockturtle/lib/fmt/fmt/os.cc \
+  -I /mnt/d/____Research____/mockturtle/include \
+  -I /mnt/d/____Research____/mockturtle/lib/kitty \
+  -I /mnt/d/____Research____/mockturtle/lib/lorina \
+  -I /mnt/d/____Research____/mockturtle/lib/parallel_hashmap \
+  -I /mnt/d/____Research____/mockturtle/lib/fmt \
+  -o /mnt/d/____Research____/mockturtle/build/mockturtle_mc_eval
+```
+
+3. Results are saved under `benchmarks/results/<timestamp>/`:
+
+- `runtime_results.csv`
+- `runtime_results.json`
+- `runtime_summary.md`
+- per-run logs in `logs/`
 
 **Using CMake:**
 
@@ -91,12 +161,58 @@ cmake --build .
 
 To target specific GPU architectures with CMake: `-DCMAKE_CUDA_ARCHITECTURES="70;80"`. With Make: `make CUDA_ARCH=sm_80`.
 
+#### EvoApproxLib cross-check (GPU vs README table)
+
+On **Windows**, build and run GPU tools under **WSL** so the CUDA runtime and GPU match your Linux toolchain. If `./build/axsim_main` fails with `libcudart.so` not found, set:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+```
+
+The script **`benchmarks/tools/evoapprox_gpu_check.py`** runs several **exhaustive** sweeps (counting PI patterns via `write_axpi010_counting_pi` in `pattern_io.py`) and compares **EP%**, **MAE%**, and **MSE** to the EvoApprox **`pareto_pwr_mae`** README tables:
+
+| Default cases | Family | Golden → approx |
+|---------------|--------|-----------------|
+| `add8u_006`, `add8u_8LL` | `adders/8_unsigned` | `add8u_0FP` → approximate |
+| `mul7u_03M`, `mul7u_069` | `multiplers/7x7_unsigned` | `mul7u_01L` → approximate |
+
+Use **`--cases all`** to also run **`add12u_20A`** (2²⁴ patterns, long run, ~48 MB `.axpi`). **`--cases add8u_006`** runs a single id.
+
+**ABC caveat:** some EvoApprox multipliers (e.g. **`mul8u_1JFF`**) use very wide internal buses that the bundled ABC Verilog reader rejects; those golden netlists are omitted until a compatible golden exists (e.g. Yosys-synthesized BLIF).
+
+On Windows the script invokes **`wsl`** automatically; in WSL/Linux:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64
+bash benchmarks/run_evoapprox_check_wsl.sh
+```
+
+Optional: `--evoapprox-root /path/to/evoapproxlib` if the library is not a sibling of AxSim-GPU.
+
+#### Publication-style experiments (scalability & throughput)
+
+For **scalability** (varying `num_patterns`) and **patterns/sec**, rebuild `axsim_main` and use **`--print-timing`** (prints `EVAL_GPU_S` and `THROUGHPUT_PATTERNS_PER_S` for the GPU pair-evaluation phase). Helper: **`benchmarks/tools/gpu_scalability_sweep.py`**; methodology and reviewer checklist: **[docs/PAPER_EXPERIMENTS.md](docs/PAPER_EXPERIMENTS.md)**; circuit examples: **`benchmarks/scalability_presets.json`**.
+
 ---
 
 ## Project layout
 
-```
+```text
 AxSim-GPU/
+├── benchmarks/
+│   ├── runtime_benchmark.py      # Multi-method runtime harness
+│   ├── runtime_config.example.json
+│   ├── runtime_config.fair.json  # Example: shared .axpi + CPU/BLASYS/GPU
+│   ├── scalability_presets.json  # Example circuits for gpu_scalability_sweep.py
+│   ├── tools/
+│   │   ├── pattern_io.py         # AXPI010 read/write + PI packing
+│   │   ├── gen_pi_patterns.py    # CLI: write .axpi for fair benchmarks
+│   │   ├── gpu_scalability_sweep.py # Paper: sweep N vs EVAL_GPU_S / throughput
+│   │   ├── evoapprox_gpu_check.py # EvoApprox adders/multipliers vs README (WSL on Windows)
+│   │   ├── verilog_eval_runtime_native.py  # iverilog baseline
+│   │   └── verilog_eval_runtime.py         # BLASYS-backed eval
+│   ├── run_evoapprox_check_wsl.sh
+│   └── results/                  # Created when you run the harness
 ├── include/axsim/
 │   ├── circuit_soa.hpp    # SoA struct and flatten_from_aig()
 │   ├── gpu_metrics.hpp    # run_gpu_metrics(), run_gpu_simulation_only(), config/result types
@@ -112,6 +228,8 @@ AxSim-GPU/
 │   └── sim_kernels.cu     # Monte Carlo kernels, error/MRED/MSE reductions, host API impl
 ├── docs/
 │   ├── GPU_SKELETON.md    # Design notes and extension points (e.g. ABC, CUB, shared memory)
+│   ├── TECHNICAL_REPORT.md # Architecture & metrics (formal write-up)
+│   ├── PAPER_EXPERIMENTS.md # Scalability / throughput / crossover checklist for publication
 │   └── TODO.md            # Progress snapshot and remaining work
 ├── Makefile               # Build with make (default)
 ├── CMakeLists.txt         # Alternative: build with CMake

@@ -129,6 +129,40 @@ __global__ void monte_carlo_kernel_simple(
     }
 }
 
+__global__ void scatter_pi_kernel(
+    uint64_t* __restrict__ node_values,
+    const uint64_t* __restrict__ pi_packed,
+    int num_nodes,
+    int num_pis,
+    int num_blocks_64,
+    int start_block)
+{
+    int block_idx = start_block + blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_idx >= num_blocks_64) return;
+    uint64_t* row = node_values + (size_t)block_idx * (size_t)num_nodes;
+    for (int pi = 0; pi < num_pis; ++pi) {
+        row[pi] = pi_packed[(size_t)pi * (size_t)num_blocks_64 + (size_t)block_idx];
+    }
+}
+
+__global__ void eval_aig_and_kernel(
+    const DeviceCircuitSoA soa,
+    uint64_t* __restrict__ node_values,
+    int num_blocks_64,
+    int start_block)
+{
+    int block_idx = start_block + blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_idx >= num_blocks_64) return;
+    uint64_t* row = node_values + (size_t)block_idx * soa.num_nodes;
+    for (int k = 0; k < soa.num_ands; k++) {
+        int n = soa.num_pis + k;
+        int f0 = soa.fanin0[k], f1 = soa.fanin1[k];
+        uint64_t v0 = soa.is_compl0[k] ? ~row[f0] : row[f0];
+        uint64_t v1 = soa.is_compl1[k] ? ~row[f1] : row[f1];
+        row[n] = v0 & v1;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // C. Metric reductions
 // -----------------------------------------------------------------------------
@@ -275,6 +309,28 @@ bool launch_monte_carlo_checked(
     return cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize after monte_carlo_kernel");
 }
 
+bool launch_scatter_eval_checked(
+    const DeviceCircuitSoA& d_soa,
+    uint64_t* d_node_values,
+    const uint64_t* d_pi_packed,
+    int num_blocks_64,
+    int num_pis)
+{
+    if (num_blocks_64 <= 0) return true;
+    const int max_blocks_per_launch = MAX_GRID_X * BLOCK;
+    for (int start = 0; start < num_blocks_64; start += max_blocks_per_launch) {
+        const int remaining = num_blocks_64 - start;
+        const int this_launch_threads = (remaining < max_blocks_per_launch) ? remaining : max_blocks_per_launch;
+        const int nblk = (this_launch_threads + BLOCK - 1) / BLOCK;
+        scatter_pi_kernel<<<nblk, BLOCK>>>(
+            d_node_values, d_pi_packed, d_soa.num_nodes, num_pis, num_blocks_64, start);
+        if (!cuda_ok(cudaGetLastError(), "scatter_pi_kernel")) return false;
+        eval_aig_and_kernel<<<nblk, BLOCK>>>(d_soa, d_node_values, num_blocks_64, start);
+        if (!cuda_ok(cudaGetLastError(), "eval_aig_and_kernel")) return false;
+    }
+    return cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize after scatter_eval");
+}
+
 inline uint64_t reconstruct_output_word(
     const std::vector<uint64_t>& packed_bits,
     size_t num_blocks_64,
@@ -327,6 +383,16 @@ GpuMetricsResult run_gpu_metrics(
         return res;
     }
 
+    const size_t expected_pi_packed = (size_t)num_pis * num_blocks_64;
+    if (!config.external_pi_packed.empty()) {
+        if (config.external_pi_packed.size() != expected_pi_packed) {
+            std::fprintf(stderr,
+                "[axsim] external_pi_packed size mismatch: expected %zu (num_pis=%d * num_blocks=%zu) got %zu\n",
+                expected_pi_packed, num_pis, num_blocks_64, config.external_pi_packed.size());
+            return res;
+        }
+    }
+
     const size_t node_values_bytes = num_blocks_64 * (size_t)num_nodes * sizeof(uint64_t);
     const size_t ref_bytes = expected_ref_size * sizeof(uint64_t);
 
@@ -337,6 +403,7 @@ GpuMetricsResult run_gpu_metrics(
     uint8_t* d_compl = nullptr;
     uint64_t* d_node_values = nullptr;
     uint64_t* d_approx_out = nullptr;
+    uint64_t* d_pi_packed = nullptr;
 
     bool success = false;
     do {
@@ -361,7 +428,15 @@ GpuMetricsResult run_gpu_metrics(
         d_soa.num_ands = num_ands;
         d_soa.num_nodes = num_nodes;
 
-        if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed)) break;
+        if (!config.external_pi_packed.empty()) {
+            if (!cuda_ok(cudaMalloc(&d_pi_packed, expected_pi_packed * sizeof(uint64_t)), "cudaMalloc d_pi_packed")) break;
+            if (!cuda_ok(cudaMemcpy(d_pi_packed, config.external_pi_packed.data(),
+                    expected_pi_packed * sizeof(uint64_t), cudaMemcpyHostToDevice),
+                    "cudaMemcpy d_pi_packed")) break;
+            if (!launch_scatter_eval_checked(d_soa, d_node_values, d_pi_packed, (int)num_blocks_64, num_pis)) break;
+        } else {
+            if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed)) break;
+        }
 
         for (int o = 0; o < num_outputs; ++o) {
             const int nid = soa.output_node_ids[o];
@@ -413,6 +488,7 @@ GpuMetricsResult run_gpu_metrics(
         success = true;
     } while (false);
 
+    cudaFree(d_pi_packed);
     cudaFree(d_compl);
     cudaFree(d_approx_out);
     cudaFree(d_node_values);
@@ -444,11 +520,22 @@ std::vector<uint64_t> run_gpu_simulation_only(
     const int num_nodes = soa.num_nodes;
     const int num_pis = soa.num_pis;
 
+    const size_t expected_pi_packed = (size_t)num_pis * num_blocks_64;
+    if (!config.external_pi_packed.empty()) {
+        if (config.external_pi_packed.size() != expected_pi_packed) {
+            std::fprintf(stderr,
+                "[axsim] run_gpu_simulation_only: external_pi_packed size mismatch: expected %zu got %zu\n",
+                expected_pi_packed, config.external_pi_packed.size());
+            return out;
+        }
+    }
+
     int* d_f0 = nullptr;
     int* d_f1 = nullptr;
     uint8_t* d_c0 = nullptr;
     uint8_t* d_c1 = nullptr;
     uint64_t* d_node_values = nullptr;
+    uint64_t* d_pi_packed = nullptr;
     bool success = false;
 
     do {
@@ -472,7 +559,15 @@ std::vector<uint64_t> run_gpu_simulation_only(
         d_soa.num_ands = num_ands;
         d_soa.num_nodes = num_nodes;
 
-        if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed)) break;
+        if (!config.external_pi_packed.empty()) {
+            if (!cuda_ok(cudaMalloc(&d_pi_packed, expected_pi_packed * sizeof(uint64_t)), "cudaMalloc d_pi_packed")) break;
+            if (!cuda_ok(cudaMemcpy(d_pi_packed, config.external_pi_packed.data(),
+                    expected_pi_packed * sizeof(uint64_t), cudaMemcpyHostToDevice),
+                    "cudaMemcpy d_pi_packed")) break;
+            if (!launch_scatter_eval_checked(d_soa, d_node_values, d_pi_packed, (int)num_blocks_64, num_pis)) break;
+        } else {
+            if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed)) break;
+        }
 
         out.resize(out_size);
         for (int o = 0; o < num_outputs; ++o) {
@@ -500,6 +595,7 @@ std::vector<uint64_t> run_gpu_simulation_only(
     } while (false);
 
     if (!success) out.clear();
+    cudaFree(d_pi_packed);
     cudaFree(d_node_values);
     cudaFree(d_c1);
     cudaFree(d_c0);

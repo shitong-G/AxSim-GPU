@@ -7,6 +7,7 @@
 
 #include "circuit_soa.hpp"
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace axsim {
@@ -17,6 +18,9 @@ struct GpuMetricsConfig {
     float delta{1e-6f};           ///< reserved (legacy bit-level MRED path)
     float mae_normalizer{255.0f}; ///< MAE% denominator (abs_diff_qor uses 2^8-1 = 255)
     bool outputs_msb_first{true}; ///< reconstruct integer as [o0..on-1]=[MSB..LSB] when true
+    /// If non-empty, use these packed PI planes (AXPI010 / pattern_io.py) instead of GPU LCG RNG.
+    /// Size must be num_pis * ceil(num_patterns/64) uint64 values.
+    std::vector<std::uint64_t> external_pi_packed;
 };
 
 struct GpuMetricsResult {
