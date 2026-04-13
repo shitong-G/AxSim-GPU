@@ -5,6 +5,7 @@
  */
 
 #include "axsim/circuit_soa.hpp"
+#include "axsim/cpu_metrics.hpp"
 #include "axsim/gpu_metrics.hpp"
 #include "axsim/abc_interface.hpp"
 #include "axsim/pattern_file.hpp"
@@ -13,8 +14,20 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <cmath>
 
 namespace {
+
+enum class BackendMode {
+    Gpu,
+    Cpu,
+    Both,
+};
+
+bool metrics_close(float a, float b, float tol) {
+    if (std::isnan(a) && std::isnan(b)) return true;
+    return std::fabs(a - b) <= tol;
+}
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
@@ -33,7 +46,11 @@ void print_usage(const char* prog) {
         "    about (2^w-1), e.g. 22-bit product -> --mae-normalizer 4194303, or MAE%% explodes.\n"
         "  - EvoApprox Verilog: use --lsb-first (O[0] is LSB); else integer output is wrong.\n"
         "  - --patterns-file <.axpi> uses shared PI planes (see benchmarks/tools/pattern_io.py).\n"
-        "  - --print-timing prints EVAL_GPU_S and THROUGHPUT_PATTERNS_PER_S (pair eval only).\n",
+        "  - --print-timing prints EVAL_*_S and THROUGHPUT (pair eval).\n"
+        "  - --timeout-seconds N : wall-clock limit (0=off). CPU checks between 64-pattern blocks;\n"
+        "    GPU checks between kernel grid chunks. Exit 124 on timeout (cannot stop mid-kernel).\n"
+        "  - --backend gpu|cpu|both : gpu=CUDA (default); cpu=host AIG MC like ResubALS-style sim;\n"
+        "    both=run CPU+GPU and compare metrics (should match) and report speedup.\n",
         prog, prog, prog, prog);
 }
 
@@ -60,6 +77,7 @@ int main(int argc, char** argv) {
     const char* approx_path = argv[2];
     const char* patterns_file = nullptr;
     bool print_timing = false;
+    BackendMode backend_mode = BackendMode::Gpu;
 
     axsim::GpuMetricsConfig config;
     config.num_patterns = 256000;
@@ -108,6 +126,28 @@ int main(int argc, char** argv) {
             patterns_file = argv[++argi];
         } else if (opt == "--print-timing") {
             print_timing = true;
+        } else if (opt == "--timeout-seconds" || opt == "--max-wall-seconds") {
+            if (argi + 1 >= argc) {
+                std::fprintf(stderr, "Missing value for %s\n", opt.c_str());
+                return 2;
+            }
+            config.max_wall_seconds = std::strtod(argv[++argi], nullptr);
+        } else if (opt == "--backend") {
+            if (argi + 1 >= argc) {
+                std::fprintf(stderr, "Missing value for %s\n", opt.c_str());
+                return 2;
+            }
+            const std::string b = argv[++argi];
+            if (b == "gpu")
+                backend_mode = BackendMode::Gpu;
+            else if (b == "cpu")
+                backend_mode = BackendMode::Cpu;
+            else if (b == "both")
+                backend_mode = BackendMode::Both;
+            else {
+                std::fprintf(stderr, "--backend must be gpu, cpu, or both (got %s)\n", b.c_str());
+                return 2;
+            }
         } else if (opt == "--help" || opt == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -141,37 +181,139 @@ int main(int argc, char** argv) {
         }
         std::printf("PI patterns: shared file %s (aligned with verilog_eval --patterns-file)\n", patterns_file);
     } else {
-        std::printf("PI patterns: GPU LCG from seed (not the same as verilog_eval random.Random)\n");
+        std::printf("PI patterns: LCG from seed (same on GPU/CPU; not verilog_eval random.Random)\n");
     }
-    std::printf("Config: patterns=%zu seed=%u mae_normalizer=%.6f outputs_msb_first=%d\n\n",
-        config.num_patterns, config.seed, config.mae_normalizer, (int)config.outputs_msb_first);
+    const char* backend_str =
+        (backend_mode == BackendMode::Gpu) ? "gpu" :
+        (backend_mode == BackendMode::Cpu) ? "cpu" : "both";
+    std::printf("Config: backend=%s patterns=%zu seed=%u mae_normalizer=%.6f outputs_msb_first=%d max_wall_seconds=%.0f\n\n",
+        backend_str, config.num_patterns, config.seed, config.mae_normalizer, (int)config.outputs_msb_first,
+        config.max_wall_seconds);
 
-    const auto t_eval0 = std::chrono::steady_clock::now();
-    axsim::GpuMetricsResult res = axsim::run_gpu_metrics_pair(soa2, soa1, config);
-    const auto t_eval1 = std::chrono::steady_clock::now();
-    const double eval_s = std::chrono::duration<double>(t_eval1 - t_eval0).count();
+    auto print_metrics = [](const char* tag, const axsim::GpuMetricsResult& r) {
+        if (tag && tag[0])
+            std::printf("%s", tag);
+        std::printf("Error rate: %.6f\n", r.error_rate);
+        std::printf("EP%%:        %.6f\n", 100.0f * r.error_rate);
+        std::printf("MAE%%:       %.6f\n", 100.0f * r.mae_norm);
+        std::printf("MSE:         %.6f\n", r.mse);
+    };
 
-    if (!res.ok) {
-        std::fprintf(stderr, "GPU metric evaluation failed.\n");
+    if (backend_mode == BackendMode::Gpu) {
+        const auto t_eval0 = std::chrono::steady_clock::now();
+        axsim::GpuMetricsResult res = axsim::run_gpu_metrics_pair(soa2, soa1, config);
+        const auto t_eval1 = std::chrono::steady_clock::now();
+        const double eval_s = std::chrono::duration<double>(t_eval1 - t_eval0).count();
+
+        if (!res.ok) {
+            if (res.timed_out)
+                std::fprintf(stderr, "GPU metric evaluation stopped (wall-clock timeout).\n");
+            else
+                std::fprintf(stderr, "GPU metric evaluation failed.\n");
+            if (print_timing)
+                std::printf("EVAL_GPU_S=%.9f\n", eval_s);
+            return res.timed_out ? 124 : 1;
+        }
+
+        print_metrics("", res);
+
         if (print_timing) {
             std::printf("EVAL_GPU_S=%.9f\n", eval_s);
+            if (eval_s > 0.0)
+                std::printf("THROUGHPUT_PATTERNS_PER_S=%.6f\n", static_cast<double>(config.num_patterns) / eval_s);
+            else
+                std::printf("THROUGHPUT_PATTERNS_PER_S=inf\n");
         }
-        return 1;
+        return 0;
     }
 
-    std::printf("Error rate: %.6f\n", res.error_rate);
-    std::printf("EP%%:        %.6f\n", 100.0f * res.error_rate);
-    std::printf("MAE%%:       %.6f\n", 100.0f * res.mae_norm);
-    std::printf("MSE:         %.6f\n", res.mse);
+    if (backend_mode == BackendMode::Cpu) {
+        const auto t_eval0 = std::chrono::steady_clock::now();
+        axsim::GpuMetricsResult res = axsim::run_cpu_metrics_pair(soa2, soa1, config);
+        const auto t_eval1 = std::chrono::steady_clock::now();
+        const double eval_s = std::chrono::duration<double>(t_eval1 - t_eval0).count();
+
+        if (!res.ok) {
+            if (res.timed_out)
+                std::fprintf(stderr, "CPU metric evaluation stopped (wall-clock timeout).\n");
+            else
+                std::fprintf(stderr, "CPU metric evaluation failed.\n");
+            if (print_timing)
+                std::printf("EVAL_CPU_S=%.9f\n", eval_s);
+            return res.timed_out ? 124 : 1;
+        }
+
+        print_metrics("", res);
+
+        if (print_timing) {
+            std::printf("EVAL_CPU_S=%.9f\n", eval_s);
+            if (eval_s > 0.0)
+                std::printf("THROUGHPUT_PATTERNS_PER_S=%.6f\n", static_cast<double>(config.num_patterns) / eval_s);
+            else
+                std::printf("THROUGHPUT_PATTERNS_PER_S=inf\n");
+        }
+        return 0;
+    }
+
+    // both
+    const auto t_gpu0 = std::chrono::steady_clock::now();
+    axsim::GpuMetricsResult res_gpu = axsim::run_gpu_metrics_pair(soa2, soa1, config);
+    const auto t_gpu1 = std::chrono::steady_clock::now();
+    const double eval_gpu_s = std::chrono::duration<double>(t_gpu1 - t_gpu0).count();
+
+    const auto t_cpu0 = std::chrono::steady_clock::now();
+    axsim::GpuMetricsResult res_cpu = axsim::run_cpu_metrics_pair(soa2, soa1, config);
+    const auto t_cpu1 = std::chrono::steady_clock::now();
+    const double eval_cpu_s = std::chrono::duration<double>(t_cpu1 - t_cpu0).count();
+
+    if (!res_gpu.ok) {
+        if (res_gpu.timed_out)
+            std::fprintf(stderr, "GPU metric evaluation stopped (wall-clock timeout).\n");
+        else
+            std::fprintf(stderr, "GPU metric evaluation failed.\n");
+        if (print_timing)
+            std::printf("EVAL_GPU_S=%.9f\nEVAL_CPU_S=%.9f\n", eval_gpu_s, eval_cpu_s);
+        return res_gpu.timed_out ? 124 : 1;
+    }
+    if (!res_cpu.ok) {
+        if (res_cpu.timed_out)
+            std::fprintf(stderr, "CPU metric evaluation stopped (wall-clock timeout).\n");
+        else
+            std::fprintf(stderr, "CPU metric evaluation failed.\n");
+        if (print_timing)
+            std::printf("EVAL_GPU_S=%.9f\nEVAL_CPU_S=%.9f\n", eval_gpu_s, eval_cpu_s);
+        return res_cpu.timed_out ? 124 : 1;
+    }
+
+    const float tol = 1e-5f;
+    const bool ok_er = metrics_close(res_gpu.error_rate, res_cpu.error_rate, tol);
+    const bool ok_mae = metrics_close(res_gpu.mae_norm, res_cpu.mae_norm, tol);
+    const float mse_tol = std::max(1e-4f, 1e-6f * std::fabs(res_gpu.mse));
+    const bool ok_mse = metrics_close(res_gpu.mse, res_cpu.mse, mse_tol);
+
+    std::printf("[GPU]\n");
+    print_metrics("", res_gpu);
+    std::printf("[CPU]\n");
+    print_metrics("", res_cpu);
+    std::printf("METRICS_CPU_GPU_MATCH=%d\n", (ok_er && ok_mae && ok_mse) ? 1 : 0);
+    if (!ok_er || !ok_mae || !ok_mse) {
+        std::fprintf(stderr,
+            "Mismatch (GPU vs CPU): ER %.9g vs %.9g, MAE_norm %.9g vs %.9g, MSE %.9g vs %.9g\n",
+            res_gpu.error_rate, res_cpu.error_rate,
+            res_gpu.mae_norm, res_cpu.mae_norm,
+            res_gpu.mse, res_cpu.mse);
+    }
 
     if (print_timing) {
-        std::printf("EVAL_GPU_S=%.9f\n", eval_s);
-        if (eval_s > 0.0) {
-            std::printf("THROUGHPUT_PATTERNS_PER_S=%.6f\n", static_cast<double>(config.num_patterns) / eval_s);
-        } else {
-            std::printf("THROUGHPUT_PATTERNS_PER_S=inf\n");
-        }
+        std::printf("EVAL_GPU_S=%.9f\n", eval_gpu_s);
+        std::printf("EVAL_CPU_S=%.9f\n", eval_cpu_s);
+        if (eval_cpu_s > 0.0 && eval_gpu_s > 0.0)
+            std::printf("SPEEDUP_GPU_VS_CPU=%.6f\n", eval_cpu_s / eval_gpu_s);
+        if (eval_gpu_s > 0.0)
+            std::printf("THROUGHPUT_GPU_PATTERNS_PER_S=%.6f\n", static_cast<double>(config.num_patterns) / eval_gpu_s);
+        if (eval_cpu_s > 0.0)
+            std::printf("THROUGHPUT_CPU_PATTERNS_PER_S=%.6f\n", static_cast<double>(config.num_patterns) / eval_cpu_s);
     }
 
-    return 0;
+    return (ok_er && ok_mae && ok_mse) ? 0 : 3;
 }

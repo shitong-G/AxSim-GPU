@@ -21,6 +21,11 @@ struct GpuMetricsConfig {
     /// If non-empty, use these packed PI planes (AXPI010 / pattern_io.py) instead of GPU LCG RNG.
     /// Size must be num_pis * ceil(num_patterns/64) uint64 values.
     std::vector<std::uint64_t> external_pi_packed;
+    /// If > 0, stop after this wall time (seconds). Cooperative: CPU checks between 64-pattern
+    /// blocks; GPU checks between kernel grid chunks (cannot interrupt a running kernel).
+    double max_wall_seconds{0.0};
+    /// Set by run_cpu_simulation_only / run_gpu_simulation_only on timeout (mutable for const config refs).
+    mutable bool wall_timed_out{false};
 };
 
 struct GpuMetricsResult {
@@ -29,6 +34,7 @@ struct GpuMetricsResult {
     float mred{0.f};        ///< backward-compatible alias of mae_norm
     float mse{0.f};         ///< word-level mean squared error
     bool ok{false};         ///< false when input validation/CUDA runtime fails
+    bool timed_out{false};  ///< true if max_wall_seconds was exceeded (cooperative abort)
 };
 
 /**

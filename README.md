@@ -32,20 +32,7 @@ AxSim-GPU is an open-source library for fast evaluation of approximate circuits.
 - **Metric semantics clarified**: `mae_norm` is the normalized MAE (and `mred` is kept as backward-compatible alias). Output bit order is configurable via `outputs_msb_first`.
 - **Manual verification tests**: `src/manual_metrics_test.cpp` includes hand-computable cases (PASS/FAIL printout) to validate ER/MAE/MSE and bit-order behavior.
 - **Build (Make)**: `CUDA_HOME` defaults to `/usr/local/cuda` (override if `cuda_runtime.h` is not found). Device code uses **`-std=c++14`** for older `nvcc`; host code remains **C++17**. Link/search paths: `-I$(CUDA_HOME)/include`, `-L$(CUDA_HOME)/lib64`.
-- **Still open**: output gather kernel, CUB reduction, optional RNG/curand path, and broader ABC parser compatibility across all third-party Verilog styles—see [docs/TODO.md](docs/TODO.md).
 - **Benchmark harness**: Shared **AXPI010** (`.axpi`) primary-input files align random vectors across **CPU iverilog** (`verilog_eval_runtime_native.py`), **BLASYS** (`verilog_eval_runtime.py`), and **`axsim_main --patterns-file`**. The native Verilog evaluator streams a hex stimulus file and uses `$readmemh` in the testbench so million-vector runs do not generate multi-gigabyte generated Verilog.
-
----
-
-## Implemented Metrics
-
-| Metric | Formula | Notes |
-|--------|--------|--------|
-| **Error Rate (ER)** | \( \frac{1}{|\mathcal{X}|} \sum_{x} \mathbb{I}[g(x) \neq f(x)] \) | Fraction of differing output bits |
-| **MRED** | \( \frac{1}{|\mathcal{X}|} \sum_{x} \frac{|g(x)-f(x)|}{\max(|f(x)|,\delta)} \) | Mean relative error; δ default 1e-6 |
-| **MSE** | \( \frac{1}{|\mathcal{X}|} \sum_{x} (g(x)-f(x))^2 \) | For Boolean outputs, matches ER |
-
-*Maximum Error Magnitude (MEM)* is planned for a future release.
 
 ---
 
@@ -129,21 +116,7 @@ cp benchmarks/runtime_config.example.json benchmarks/runtime_config.json
 python3 benchmarks/runtime_benchmark.py --config benchmarks/runtime_config.json
 ```
 
-For Mockturtle integration, build helper binary once:
-
-```bash
-g++ -O3 -std=c++17 benchmarks/tools/mockturtle_mc_eval.cpp \
-  /mnt/d/____Research____/mockturtle/lib/fmt/fmt/format.cc \
-  /mnt/d/____Research____/mockturtle/lib/fmt/fmt/os.cc \
-  -I /mnt/d/____Research____/mockturtle/include \
-  -I /mnt/d/____Research____/mockturtle/lib/kitty \
-  -I /mnt/d/____Research____/mockturtle/lib/lorina \
-  -I /mnt/d/____Research____/mockturtle/lib/parallel_hashmap \
-  -I /mnt/d/____Research____/mockturtle/lib/fmt \
-  -o /mnt/d/____Research____/mockturtle/build/mockturtle_mc_eval
-```
-
-3. Results are saved under `benchmarks/results/<timestamp>/`:
+2. Results are saved under `benchmarks/results/<timestamp>/`:
 
 - `runtime_results.csv`
 - `runtime_results.json`
@@ -161,81 +134,19 @@ cmake --build .
 
 To target specific GPU architectures with CMake: `-DCMAKE_CUDA_ARCHITECTURES="70;80"`. With Make: `make CUDA_ARCH=sm_80`.
 
-#### EvoApproxLib cross-check (GPU vs README table)
-
-On **Windows**, build and run GPU tools under **WSL** so the CUDA runtime and GPU match your Linux toolchain. If `./build/axsim_main` fails with `libcudart.so` not found, set:
-
-```bash
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-```
-
-The script **`benchmarks/tools/evoapprox_gpu_check.py`** runs several **exhaustive** sweeps (counting PI patterns via `write_axpi010_counting_pi` in `pattern_io.py`) and compares **EP%**, **MAE%**, and **MSE** to the EvoApprox **`pareto_pwr_mae`** README tables:
-
-| Default cases | Family | Golden → approx |
-|---------------|--------|-----------------|
-| `add8u_006`, `add8u_8LL` | `adders/8_unsigned` | `add8u_0FP` → approximate |
-| `mul7u_03M`, `mul7u_069` | `multiplers/7x7_unsigned` | `mul7u_01L` → approximate |
-
-Use **`--cases all`** to also run **`add12u_20A`** (2²⁴ patterns, long run, ~48 MB `.axpi`). **`--cases add8u_006`** runs a single id.
-
-**ABC caveat:** some EvoApprox multipliers (e.g. **`mul8u_1JFF`**) use very wide internal buses that the bundled ABC Verilog reader rejects; those golden netlists are omitted until a compatible golden exists (e.g. Yosys-synthesized BLIF).
-
-On Windows the script invokes **`wsl`** automatically; in WSL/Linux:
-
-```bash
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64
-bash benchmarks/run_evoapprox_check_wsl.sh
-```
-
-Optional: `--evoapprox-root /path/to/evoapproxlib` if the library is not a sibling of AxSim-GPU.
-
 #### Publication-style experiments (scalability & throughput)
 
 For **scalability** (varying `num_patterns`) and **patterns/sec**, rebuild `axsim_main` and use **`--print-timing`** (prints `EVAL_GPU_S` and `THROUGHPUT_PATTERNS_PER_S` for the GPU pair-evaluation phase). Helper: **`benchmarks/tools/gpu_scalability_sweep.py`**; methodology and reviewer checklist: **[docs/PAPER_EXPERIMENTS.md](docs/PAPER_EXPERIMENTS.md)**; circuit examples: **`benchmarks/scalability_presets.json`**.
 
----
+#### Multi-circuit AIG speed sweep (self-comparison)
 
-## Project layout
+Put representative **`.aig`** files under **`aig/`** and run:
 
-```text
-AxSim-GPU/
-├── benchmarks/
-│   ├── runtime_benchmark.py      # Multi-method runtime harness
-│   ├── runtime_config.example.json
-│   ├── runtime_config.fair.json  # Example: shared .axpi + CPU/BLASYS/GPU
-│   ├── scalability_presets.json  # Example circuits for gpu_scalability_sweep.py
-│   ├── tools/
-│   │   ├── pattern_io.py         # AXPI010 read/write + PI packing
-│   │   ├── gen_pi_patterns.py    # CLI: write .axpi for fair benchmarks
-│   │   ├── gpu_scalability_sweep.py # Paper: sweep N vs EVAL_GPU_S / throughput
-│   │   ├── evoapprox_gpu_check.py # EvoApprox adders/multipliers vs README (WSL on Windows)
-│   │   ├── verilog_eval_runtime_native.py  # iverilog baseline
-│   │   └── verilog_eval_runtime.py         # BLASYS-backed eval
-│   ├── run_evoapprox_check_wsl.sh
-│   └── results/                  # Created when you run the harness
-├── include/axsim/
-│   ├── circuit_soa.hpp    # SoA struct and flatten_from_aig()
-│   ├── gpu_metrics.hpp    # run_gpu_metrics(), run_gpu_simulation_only(), config/result types
-│   └── abc_interface.hpp  # soa_from_abc_file() — read AIG/BLIF/Verilog via ABC
-├── src/
-│   ├── circuit_soa.cpp    # CPU SoA construction from AIG list
-│   ├── interface.cpp      # ABC → SoA (optional; build with AXSIM_USE_ABC and link libabc)
-│   ├── main_axsim.cpp     # CLI runner: golden vs approximate netlists
-│   ├── manual_metrics_test.cpp # Hand-checkable metric sanity tests
-│   ├── evo_compare.cpp    # EvoApprox-style pair comparison helper
-│   └── metrics.py         # Python reference: ER, MRED, MSE (truth-table)
-├── cuda/
-│   └── sim_kernels.cu     # Monte Carlo kernels, error/MRED/MSE reductions, host API impl
-├── docs/
-│   ├── GPU_SKELETON.md    # Design notes and extension points (e.g. ABC, CUB, shared memory)
-│   ├── TECHNICAL_REPORT.md # Architecture & metrics (formal write-up)
-│   ├── PAPER_EXPERIMENTS.md # Scalability / throughput / crossover checklist for publication
-│   └── TODO.md            # Progress snapshot and remaining work
-├── Makefile               # Build with make (default)
-├── CMakeLists.txt         # Alternative: build with CMake
-├── LICENSE
-└── README.md
+```bash
+python3 benchmarks/tools/aig_speed_sweep.py --config benchmarks/aig_speed_sweep_config.json
 ```
+
+This sweeps a pattern grid (default includes **1e4 … 1e7**), optionally **`--only`** a subset of circuits, and writes CSV + logs under **`benchmarks/results/`**. Use **`--backend gpu`** for throughput-only curves when the CPU path is too slow or memory-heavy at large pattern counts.
 
 ---
 
@@ -316,8 +227,6 @@ mse = m.compute_mse(g_values, f_values)
 - **Performance**: See `docs/GPU_SKELETON.md` for shared-memory caching of PIs, CUB-based reduction, and a single output-gather kernel.
 
 **Building with ABC (optional):** To enable `soa_from_abc_file()` for AIG/BLIF/Verilog, build with ABC: define `AXSIM_USE_ABC`, add ABC include path (e.g. `-I path/to/abc/src`), and link libabc. Example with Make: `make CXXFLAGS="-DAXSIM_USE_ABC -I/path/to/abc/src" LDFLAGS="-L/path/to/abc -labc"`. Without ABC, the interface compiles as a stub that returns an invalid SoA.
-
-A **checklist of remaining work** (ref output pipeline, large-pattern grid limit, ABC/AIG wiring, optional optimizations, MEM, tests) is in [docs/TODO.md](docs/TODO.md).
 
 ---
 

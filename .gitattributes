@@ -1,0 +1,2 @@
+# Bash scripts must use LF (WSL/Linux); CRLF breaks `set -euo pipefail`
+*.sh text eol=lf

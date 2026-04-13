@@ -27,9 +27,13 @@ set_target_properties(axsim_cuda PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
 
+# CPU AIG Monte Carlo (same semantics as GPU kernels)
+add_library(axsim_cpu STATIC src/cpu_sim_metrics.cpp)
+target_include_directories(axsim_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # Executable
 add_executable(axsim_main src/main_axsim.cpp)
-target_link_libraries(axsim_main PRIVATE axsim_soa axsim_cuda)
+target_link_libraries(axsim_main PRIVATE axsim_soa axsim_cuda axsim_cpu)
 
 # Optional: CUB for faster reduction (NVIDIA CUB is in toolkit)
 # target_include_directories(axsim_cuda PRIVATE ${CUDAToolkit_INCLUDE_DIRS})

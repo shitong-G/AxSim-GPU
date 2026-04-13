@@ -42,9 +42,9 @@ NVCCFLAGS += -arch=$(CUDA_ARCH)
 # Output and objects (all .o in build/)
 BUILD     := build
 EXE       := $(BUILD)/axsim_main
-SRC_CPP   := src/main_axsim.cpp src/circuit_soa.cpp src/interface.cpp src/pattern_file.cpp
+SRC_CPP   := src/main_axsim.cpp src/circuit_soa.cpp src/interface.cpp src/pattern_file.cpp src/cpu_sim_metrics.cpp
 SRC_CU    := cuda/sim_kernels.cu
-OBJ_CPP   := $(BUILD)/main_axsim.o $(BUILD)/circuit_soa.o $(BUILD)/interface.o $(BUILD)/pattern_file.o
+OBJ_CPP   := $(BUILD)/main_axsim.o $(BUILD)/circuit_soa.o $(BUILD)/interface.o $(BUILD)/pattern_file.o $(BUILD)/cpu_sim_metrics.o
 OBJ_CU    := $(BUILD)/sim_kernels.o
 OBJS      := $(OBJ_CPP) $(OBJ_CU)
 
@@ -61,6 +61,9 @@ $(BUILD)/interface.o: src/interface.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/pattern_file.o: src/pattern_file.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/cpu_sim_metrics.o: src/cpu_sim_metrics.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/sim_kernels.o: cuda/sim_kernels.cu | $(BUILD)

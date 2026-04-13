@@ -9,7 +9,6 @@
 namespace axsim {
 
 bool CircuitSoA::valid() const {
-    // Reject default-constructed/failed SoA early.
     if (num_pis < 0 || num_nodes <= 0 || num_outputs <= 0) return false;
     if (num_pis < 0 || num_ands < 0 || num_nodes != num_pis + num_ands) return false;
     if ((int)fanin0_indices.size() != num_ands) return false;
@@ -60,4 +59,4 @@ CircuitSoA flatten_from_aig(
     return soa;
 }
 
-} // namespace axsim
+}

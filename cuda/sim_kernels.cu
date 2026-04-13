@@ -275,6 +275,7 @@ __global__ void mse_sum_kernel(
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <chrono>
 
 namespace axsim {
 
@@ -291,12 +292,21 @@ bool cuda_ok(cudaError_t err, const char* what) {
     return true;
 }
 
+inline bool wall_timeout(const GpuMetricsConfig& config, std::chrono::steady_clock::time_point t0) {
+    if (config.max_wall_seconds <= 0.0) return false;
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= config.max_wall_seconds;
+}
+
 bool launch_monte_carlo_checked(
     const DeviceCircuitSoA& d_soa,
     uint64_t* d_node_values,
     int num_blocks_64,
-    unsigned int seed)
+    unsigned int seed,
+    const GpuMetricsConfig& config,
+    std::chrono::steady_clock::time_point t0,
+    bool& timed_out)
 {
+    timed_out = false;
     if (num_blocks_64 <= 0) return true;
     const int max_blocks_per_launch = MAX_GRID_X * BLOCK;
     for (int start = 0; start < num_blocks_64; start += max_blocks_per_launch) {
@@ -305,8 +315,15 @@ bool launch_monte_carlo_checked(
         const int nblk = (this_launch_threads + BLOCK - 1) / BLOCK;
         monte_carlo_kernel<<<nblk, BLOCK>>>(d_soa, d_node_values, num_blocks_64, seed, start);
         if (!cuda_ok(cudaGetLastError(), "launch monte_carlo_kernel")) return false;
+        if (!cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize after monte_carlo chunk")) return false;
+        if (wall_timeout(config, t0)) {
+            timed_out = true;
+            std::fprintf(stderr, "[axsim] GPU wall-clock timeout during monte_carlo (max_wall_seconds=%.0f)\n",
+                config.max_wall_seconds);
+            return false;
+        }
     }
-    return cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize after monte_carlo_kernel");
+    return true;
 }
 
 bool launch_scatter_eval_checked(
@@ -314,8 +331,12 @@ bool launch_scatter_eval_checked(
     uint64_t* d_node_values,
     const uint64_t* d_pi_packed,
     int num_blocks_64,
-    int num_pis)
+    int num_pis,
+    const GpuMetricsConfig& config,
+    std::chrono::steady_clock::time_point t0,
+    bool& timed_out)
 {
+    timed_out = false;
     if (num_blocks_64 <= 0) return true;
     const int max_blocks_per_launch = MAX_GRID_X * BLOCK;
     for (int start = 0; start < num_blocks_64; start += max_blocks_per_launch) {
@@ -327,23 +348,32 @@ bool launch_scatter_eval_checked(
         if (!cuda_ok(cudaGetLastError(), "scatter_pi_kernel")) return false;
         eval_aig_and_kernel<<<nblk, BLOCK>>>(d_soa, d_node_values, num_blocks_64, start);
         if (!cuda_ok(cudaGetLastError(), "eval_aig_and_kernel")) return false;
+        if (!cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize after scatter_eval chunk")) return false;
+        if (wall_timeout(config, t0)) {
+            timed_out = true;
+            std::fprintf(stderr, "[axsim] GPU wall-clock timeout during scatter_eval (max_wall_seconds=%.0f)\n",
+                config.max_wall_seconds);
+            return false;
+        }
     }
-    return cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize after scatter_eval");
+    return true;
 }
 
-inline uint64_t reconstruct_output_word(
+/** Pack up to 64 consecutive PO bits (starting at o0) into a uint64_t; n in 1..64. */
+inline uint64_t reconstruct_output_chunk(
     const std::vector<uint64_t>& packed_bits,
     size_t num_blocks_64,
     size_t blk,
     int bit,
-    int num_outputs,
+    int o0,
+    int n,
     bool outputs_msb_first)
 {
     uint64_t out = 0;
-    for (int o = 0; o < num_outputs; ++o) {
-        const size_t idx = (size_t)o * num_blocks_64 + blk;
+    for (int local_o = 0; local_o < n; ++local_o) {
+        const size_t idx = (size_t)(o0 + local_o) * num_blocks_64 + blk;
         const uint64_t b = (packed_bits[idx] >> bit) & 1ULL;
-        const int pos = outputs_msb_first ? (num_outputs - 1 - o) : o;
+        const int pos = outputs_msb_first ? (n - 1 - local_o) : local_o;
         out |= (b << pos);
     }
     return out;
@@ -371,8 +401,8 @@ GpuMetricsResult run_gpu_metrics(
     const int num_nodes = soa.num_nodes;
     const int num_pis = soa.num_pis;
     const int num_outputs = soa.num_outputs;
-    if (num_outputs <= 0 || num_outputs > 64) {
-        std::fprintf(stderr, "[axsim] run_gpu_metrics requires 1..64 outputs, got %d\n", num_outputs);
+    if (num_outputs <= 0) {
+        std::fprintf(stderr, "[axsim] run_gpu_metrics requires num_outputs >= 1, got %d\n", num_outputs);
         return res;
     }
 
@@ -406,6 +436,7 @@ GpuMetricsResult run_gpu_metrics(
     uint64_t* d_pi_packed = nullptr;
 
     bool success = false;
+    const auto t_wall0 = std::chrono::steady_clock::now();
     do {
         if (!cuda_ok(cudaMalloc(&d_f0, num_ands * sizeof(int)), "cudaMalloc d_f0")) break;
         if (!cuda_ok(cudaMalloc(&d_f1, num_ands * sizeof(int)), "cudaMalloc d_f1")) break;
@@ -428,14 +459,23 @@ GpuMetricsResult run_gpu_metrics(
         d_soa.num_ands = num_ands;
         d_soa.num_nodes = num_nodes;
 
+        bool launch_to = false;
         if (!config.external_pi_packed.empty()) {
             if (!cuda_ok(cudaMalloc(&d_pi_packed, expected_pi_packed * sizeof(uint64_t)), "cudaMalloc d_pi_packed")) break;
             if (!cuda_ok(cudaMemcpy(d_pi_packed, config.external_pi_packed.data(),
                     expected_pi_packed * sizeof(uint64_t), cudaMemcpyHostToDevice),
                     "cudaMemcpy d_pi_packed")) break;
-            if (!launch_scatter_eval_checked(d_soa, d_node_values, d_pi_packed, (int)num_blocks_64, num_pis)) break;
+            if (!launch_scatter_eval_checked(d_soa, d_node_values, d_pi_packed, (int)num_blocks_64, num_pis,
+                    config, t_wall0, launch_to)) {
+                if (launch_to) res.timed_out = true;
+                break;
+            }
         } else {
-            if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed)) break;
+            if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed,
+                    config, t_wall0, launch_to)) {
+                if (launch_to) res.timed_out = true;
+                break;
+            }
         }
 
         for (int o = 0; o < num_outputs; ++o) {
@@ -467,19 +507,39 @@ GpuMetricsResult run_gpu_metrics(
         double mae_norm_sum = 0.0;
         double mse_sum = 0.0;
         const double normalizer = (config.mae_normalizer > 0.0f) ? (double)config.mae_normalizer : 1.0;
+        const int num_chunks = (num_outputs + 63) / 64;
         for (size_t p = 0; p < requested_patterns; ++p) {
+            if (config.max_wall_seconds > 0.0 && (p % 100000u) == 0u && p > 0u &&
+                wall_timeout(config, t_wall0)) {
+                std::fprintf(stderr, "[axsim] GPU wall-clock timeout during host metric reduction (max_wall_seconds=%.0f)\n",
+                    config.max_wall_seconds);
+                res.timed_out = true;
+                break;
+            }
             const size_t blk = p >> 6;
             const int bit = (int)(p & 63);
-            const uint64_t approx_word = reconstruct_output_word(
-                h_approx, num_blocks_64, blk, bit, num_outputs, config.outputs_msb_first);
-            const uint64_t ref_word = reconstruct_output_word(
-                ref_outputs, num_blocks_64, blk, bit, num_outputs, config.outputs_msb_first);
-
-            if (approx_word != ref_word) ++err_patterns;
-            const double diff = (double)approx_word - (double)ref_word;
-            mse_sum += diff * diff;
-            mae_norm_sum += std::abs(diff) / normalizer;
+            double mse_p = 0.0;
+            double mae_p = 0.0;
+            bool match = true;
+            for (int c = 0; c < num_chunks; ++c) {
+                const int o0 = c * 64;
+                const int n = (num_outputs - o0 < 64) ? (num_outputs - o0) : 64;
+                const uint64_t wa = reconstruct_output_chunk(
+                    h_approx, num_blocks_64, blk, bit, o0, n, config.outputs_msb_first);
+                const uint64_t wr = reconstruct_output_chunk(
+                    ref_outputs, num_blocks_64, blk, bit, o0, n, config.outputs_msb_first);
+                if (wa != wr) match = false;
+                const double diff = (double)wa - (double)wr;
+                mse_p += diff * diff;
+                mae_p += std::abs(diff) / normalizer;
+            }
+            const double inv_chunks = 1.0 / (double)num_chunks;
+            mse_sum += mse_p * inv_chunks;
+            mae_norm_sum += mae_p * inv_chunks;
+            if (!match) ++err_patterns;
         }
+
+        if (res.timed_out) break;
 
         res.error_rate = (float)err_patterns / (float)requested_patterns;
         res.mae_norm = (float)(mae_norm_sum / (double)requested_patterns);
@@ -537,7 +597,9 @@ std::vector<uint64_t> run_gpu_simulation_only(
     uint64_t* d_node_values = nullptr;
     uint64_t* d_pi_packed = nullptr;
     bool success = false;
+    config.wall_timed_out = false;
 
+    const auto t_wall0 = std::chrono::steady_clock::now();
     do {
         if (!cuda_ok(cudaMalloc(&d_f0, num_ands * sizeof(int)), "cudaMalloc d_f0")) break;
         if (!cuda_ok(cudaMalloc(&d_f1, num_ands * sizeof(int)), "cudaMalloc d_f1")) break;
@@ -559,14 +621,23 @@ std::vector<uint64_t> run_gpu_simulation_only(
         d_soa.num_ands = num_ands;
         d_soa.num_nodes = num_nodes;
 
+        bool launch_to = false;
         if (!config.external_pi_packed.empty()) {
             if (!cuda_ok(cudaMalloc(&d_pi_packed, expected_pi_packed * sizeof(uint64_t)), "cudaMalloc d_pi_packed")) break;
             if (!cuda_ok(cudaMemcpy(d_pi_packed, config.external_pi_packed.data(),
                     expected_pi_packed * sizeof(uint64_t), cudaMemcpyHostToDevice),
                     "cudaMemcpy d_pi_packed")) break;
-            if (!launch_scatter_eval_checked(d_soa, d_node_values, d_pi_packed, (int)num_blocks_64, num_pis)) break;
+            if (!launch_scatter_eval_checked(d_soa, d_node_values, d_pi_packed, (int)num_blocks_64, num_pis,
+                    config, t_wall0, launch_to)) {
+                if (launch_to) config.wall_timed_out = true;
+                break;
+            }
         } else {
-            if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed)) break;
+            if (!launch_monte_carlo_checked(d_soa, d_node_values, (int)num_blocks_64, config.seed,
+                    config, t_wall0, launch_to)) {
+                if (launch_to) config.wall_timed_out = true;
+                break;
+            }
         }
 
         out.resize(out_size);
@@ -618,6 +689,10 @@ GpuMetricsResult run_gpu_metrics_pair(
         return res;
     }
     const std::vector<uint64_t> ref_outputs = run_gpu_simulation_only(golden_soa, config);
+    if (config.wall_timed_out) {
+        res.timed_out = true;
+        return res;
+    }
     if (ref_outputs.empty() && config.num_patterns != 0) return res;
     return run_gpu_metrics(approx_soa, ref_outputs, config);
 }

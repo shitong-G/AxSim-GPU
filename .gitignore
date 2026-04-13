@@ -14,3 +14,8 @@ benchmarks/
 benchmarks/.venv/
 benchmarks/patterns/*.axpi
 evoapproxlib/
+
+benchmarks/results/**/*
+!benchmarks/results/README.md
+docs/TODO.md
+docs/GPU_SKELETON.md

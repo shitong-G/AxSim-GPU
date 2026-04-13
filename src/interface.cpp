@@ -227,4 +227,4 @@ CircuitSoA soa_from_abc_file(const char* filename) {
 #endif
 }
 
-} // namespace axsim
+}
