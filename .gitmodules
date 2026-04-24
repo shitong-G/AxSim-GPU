@@ -1,0 +1,4 @@
+[submodule "BACS"]
+	path = BACS
+	url = https://github.com/scale-lab/BACS.git
+	ignore = dirty

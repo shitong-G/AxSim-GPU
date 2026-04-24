@@ -45,7 +45,7 @@ void print_usage(const char* prog) {
         "  - Default mae_normalizer=255 fits ~8b-output benchmarks; for w-bit unsigned words use\n"
         "    about (2^w-1), e.g. 22-bit product -> --mae-normalizer 4194303, or MAE%% explodes.\n"
         "  - EvoApprox Verilog: use --lsb-first (O[0] is LSB); else integer output is wrong.\n"
-        "  - --patterns-file <.axpi> uses shared PI planes (see benchmarks/tools/pattern_io.py).\n"
+        "  - --patterns-file <.axpi> uses shared PI planes (see scripts/pattern_io.py).\n"
         "  - --print-timing prints EVAL_*_S and THROUGHPUT (pair eval).\n"
         "  - --timeout-seconds N : wall-clock limit (0=off). CPU checks between 64-pattern blocks;\n"
         "    GPU checks between kernel grid chunks. Exit 124 on timeout (cannot stop mid-kernel).\n"

@@ -4,12 +4,12 @@
 *.ptx
 *.cubin
 *.fatbin
+__pycache__/
 
 build/
 abc/
 bin/
 docs/
-BACS/
 benchmarks/
 benchmarks/.venv/
 benchmarks/patterns/*.axpi
