@@ -109,14 +109,3 @@ See `benchmarks/README.md` for details.
 
 MIT License. See `LICENSE`.
 
-## Contributing
-
-- Open an issue first for major changes.
-- Keep PRs focused and small.
-- Run local build/tests before submitting.
-
-## Troubleshooting
-
-- Submodule missing: run `git submodule update --init --recursive`.
-- CUDA not found: set `CUDA_HOME` when invoking `make`.
-- Build directory issues: remove `build/` and reconfigure.
